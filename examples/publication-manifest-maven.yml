@@ -1,3 +1,4 @@
+# Projects that run a license check (apache-rat in Apache forks): keep the project's own license header above this comment, copied from publish.yml.
 # Regenerates .readiness/publication.yaml for a Maven project (example: Ozone).
 # The publish command is the one from publish.yml; the sandbox action redirects deployment to a local
 # directory, and `packages: read` guarantees that nothing can be uploaded even if the redirect were lost.
@@ -50,6 +51,8 @@ jobs:
         if: steps.manifest.outputs.changed == 'true' && github.event_name == 'workflow_dispatch'
         uses: peter-evans/create-pull-request@v7   # pin to a SHA in the project
         with:
+          # Commit only the manifest
+          add-paths: .readiness/publication.yaml
           branch: readiness/publication-manifest
           title: 'readiness: refresh publication manifest'
           commit-message: 'readiness: refresh publication manifest from the publisher sandbox'

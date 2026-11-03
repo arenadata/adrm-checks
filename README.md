@@ -38,7 +38,8 @@ by ADRM; the report does not assert it.
 
 2. **Add the wrapper** `.github/workflows/release-readiness.yml` from `examples/release-readiness.yml`, replacing
    `<commit sha of adrm-checks>` with the pinned SHA of this repository. The wrapper contains no logic: only the ADRM
-   inputs and the `uses:` of the reusable workflow. It must exist on the default branch and on every line branch: ADRM
+   inputs and the `uses:` of the reusable workflow.The wrapper must exist on
+   the default branch and on every line branch: ADRM
    dispatches it on the default branch to check the artifacts of a tag and on the line branch to inspect the declared
    version (see "Line branch inspection").
 

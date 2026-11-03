@@ -1,3 +1,4 @@
+# Projects that run a license check (apache-rat in Apache forks): keep the project's own license header above this comment, copied from publish.yml.
 # Thin wrapper to place in the project at .github/workflows/release-readiness.yml. It must exist on the default
 # branch (GitHub dispatches from there) and on every line branch: ADRM dispatches it on the line branch itself
 # in mode=inspect to learn the declared project version of the branch head.
