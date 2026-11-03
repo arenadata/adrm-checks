@@ -1,0 +1,41 @@
+name: ADRM publication readiness (composite)
+description: >
+  Alternative to the reusable workflow for projects that prefer a step inside their own job. command=emit runs
+  the publication check against the project manifest and writes result.json; command=line reports the declared
+  project version of a branch checkout as line.json (mode=inspect). The caller must have checked out the project
+  (.readiness at ${{ github.workflow_sha }} for emit, the branch head for line) and must pass the ADRM dispatch
+  inputs as environment variables.
+inputs:
+  command:
+    description: emit (publication check, result.json) or line (declared version of the checkout, line.json)
+    required: false
+    default: emit
+  manifest:
+    description: Path to publication.yaml in the caller checkout (emit)
+    required: false
+    default: .readiness/publication.yaml
+  from:
+    description: Checkout directory whose build files declare the version (line)
+    required: false
+    default: .
+  result:
+    description: Where to write result.json or line.json
+    required: false
+    default: ''
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        COMMAND: ${{ inputs.command }}
+        MANIFEST: ${{ inputs.manifest }}
+        FROM: ${{ inputs.from }}
+        RESULT: ${{ inputs.result }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        case "$COMMAND" in
+          emit) node "$ACTION_PATH/../../src/publication-manifest.mjs" emit --manifest "$MANIFEST" --out "${RESULT:-result.json}" ;;
+          line) node "$ACTION_PATH/../../src/publication-manifest.mjs" line --from "$FROM" --out "${RESULT:-line.json}" ;;
+          *) echo "::error::command must be emit or line"; exit 1 ;;
+        esac

@@ -1,0 +1,39 @@
+// ADRM sandbox publish (Gradle). Public API only. Every PublishToMavenRepository task in the executed graph
+// whose repository is remote (http/https) is pointed at a fresh local file repository without credentials.
+// One report file per Gradle invocation; the build fails if any remote publish task is left untouched.
+import org.gradle.api.publish.maven.tasks.PublishToMavenRepository
+
+def sandboxRoot = System.getenv('ADRM_SANDBOX_DIR')
+if (sandboxRoot == null || sandboxRoot.isEmpty()) {
+  throw new GradleException('ADRM sandbox: ADRM_SANDBOX_DIR is not set')
+}
+gradle.taskGraph.whenReady { graph ->
+  def redirected = []
+  def untouched = []
+  graph.allTasks.findAll { it instanceof PublishToMavenRepository }.each { task ->
+    def repo = task.repository
+    def original = repo?.url
+    def scheme = original?.scheme
+    if (scheme == 'http' || scheme == 'https') {
+      def project = task.project
+      def target = new File(sandboxRoot, repo.name)
+      def sandbox = project.repositories.maven { r ->
+        r.name = "adrmSandbox-${repo.name}"
+        r.url = target.toURI()
+      }
+      project.repositories.remove(sandbox)
+      task.repository = sandbox
+      redirected << "${task.path}\t${repo.name}\t${original}\t${target.toURI()}"
+    } else {
+      untouched << "${task.path}\t${repo?.name}\t${original}"
+    }
+  }
+  def reportDir = new File(sandboxRoot, 'adrm-reports'); reportDir.mkdirs()
+  def report = new File(reportDir, "redirects-${System.currentTimeMillis()}.tsv")
+  report.text = (redirected.collect { "redirected\t${it}" } + untouched.collect { "untouched\t${it}" }).join('\n') + '\n'
+  def remaining = graph.allTasks.findAll { it instanceof PublishToMavenRepository && ['http', 'https'].contains(it.repository?.url?.scheme) }
+  if (!remaining.isEmpty()) {
+    throw new GradleException("ADRM sandbox: remote publish tasks still present: ${remaining*.path}")
+  }
+  println("ADRM sandbox: redirected ${redirected.size()} publish task(s), untouched ${untouched.size()}; report ${report}")
+}

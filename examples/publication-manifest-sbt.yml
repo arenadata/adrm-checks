@@ -1,0 +1,56 @@
+# Regenerates .readiness/publication.yaml for an sbt project. The sandbox action installs a global sbt plugin
+# (~/.sbt/1.0/plugins/AdrmSandbox.scala) that points every project's `publish` at a file repository and fails
+# the build if a project would still publish elsewhere; the project's own publish command runs unchanged.
+# `packages: read` guarantees that nothing can be uploaded. No Arenadata fork publishes with sbt today (the Spark
+# fork deploys with Maven, see publication-manifest-maven.yml); this is the template for one that does.
+name: Publication manifest
+on:
+  workflow_dispatch:
+  pull_request:
+    paths: ['**/*.sbt', 'project/**', '.github/workflows/publish.yml', '.readiness/publication.yaml']
+
+permissions:
+  contents: write
+  pull-requests: write
+  packages: read
+
+jobs:
+  manifest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: sbt
+      - uses: sbt/setup-sbt@v1
+      - name: Redirect the publisher to a sandbox
+        id: sandbox
+        uses: arenadata/adrm-checks/actions/sandbox@<commit sha of adrm-checks>
+        with:
+          tool: sbt
+      - name: Run the publisher exactly as publish.yml does
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # read-only: resolves dependency packages, cannot upload
+        run: sbt --batch <publish command from publish.yml, e.g. +publish>
+      - name: Generate the manifest from the sandbox
+        id: manifest
+        uses: arenadata/adrm-checks/actions/manifest@<commit sha of adrm-checks>
+        with:
+          sandbox: ${{ steps.sandbox.outputs.dir }}   # sbt writes the Maven layout directly into the sandbox directory
+          invocations: '1'
+      - name: Open a pull request when the module/file set changed
+        if: steps.manifest.outputs.changed == 'true' && github.event_name == 'workflow_dispatch'
+        uses: peter-evans/create-pull-request@v7   # pin to a SHA in the project
+        with:
+          branch: readiness/publication-manifest
+          title: 'readiness: refresh publication manifest'
+          commit-message: 'readiness: refresh publication manifest from the publisher sandbox'
+          body: 'The module/file set produced by the publisher differs from .readiness/publication.yaml. Review the diff.'
+      - name: Fail the pull request check when the manifest is stale
+        if: steps.manifest.outputs.changed == 'true' && github.event_name == 'pull_request'
+        run: |
+          git --no-pager diff -- .readiness/publication.yaml
+          echo "::error::.readiness/publication.yaml is stale; regenerate it (see adrm-checks README)"; exit 1

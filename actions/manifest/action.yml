@@ -1,0 +1,51 @@
+name: ADRM publication manifest
+description: Generates .readiness/publication.yaml from a publisher sandbox directory and reports whether the module/file set changed.
+inputs:
+  sandbox:
+    description: Directory with the Maven-layout tree written by the redirected publisher (for Gradle, <sandbox dir>/<repository name>)
+    required: true
+  repository:
+    description: owner/name of the project
+    required: false
+    default: ${{ github.repository }}
+  registry:
+    description: Registry base URL recorded in the manifest
+    required: false
+    default: ''
+  out:
+    description: Manifest path
+    required: false
+    default: .readiness/publication.yaml
+  invocations:
+    description: Number of publisher invocations that filled the sandbox (provenance only)
+    required: false
+    default: ''
+outputs:
+  changed:
+    description: true when the module/file set differs from the previous manifest
+    value: ${{ steps.generate.outputs.changed }}
+runs:
+  using: composite
+  steps:
+    - id: generate
+      shell: bash
+      env:
+        SANDBOX: ${{ inputs.sandbox }}
+        REPOSITORY: ${{ inputs.repository }}
+        REGISTRY: ${{ inputs.registry }}
+        OUT: ${{ inputs.out }}
+        INVOCATIONS: ${{ inputs.invocations }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set +e
+        args=(generate --from-sandbox "$SANDBOX" --repo "$REPOSITORY" --source-sha "$GITHUB_SHA" --source-ref "$GITHUB_REF_NAME" --out "$OUT" --exit-code-on-change)
+        [ -n "$REGISTRY" ] && args+=(--registry "$REGISTRY")
+        [ -n "$INVOCATIONS" ] && args+=(--invocations "$INVOCATIONS")
+        node "$ACTION_PATH/../../src/publication-manifest.mjs" "${args[@]}"
+        code=$?
+        set -e
+        case "$code" in
+          0) echo "changed=false" >> "$GITHUB_OUTPUT" ;;
+          3) echo "changed=true" >> "$GITHUB_OUTPUT" ;;
+          *) exit "$code" ;;
+        esac

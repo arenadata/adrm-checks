@@ -1,0 +1,7 @@
+node_modules/
+*.result.json
+/tmp/
+/.idea/
+
+# Local working notes, not part of the repository
+docs/ONBOARDING.md

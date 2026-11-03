@@ -1,0 +1,65 @@
+name: ADRM publisher sandbox
+description: >
+  Redirects the project's own publisher to a local directory so that its real publish commands can run
+  without uploading anything. Maven: alt*DeploymentRepository via MAVEN_OPTS. Gradle: init script in
+  GRADLE_USER_HOME/init.d that points PublishToMavenRepository tasks at a file repository. sbt: global
+  plugin in ~/.sbt/1.0/plugins that points every project's publish at a file repository.
+inputs:
+  tool:
+    description: maven, gradle or sbt
+    required: true
+  deploy-plugin-major:
+    description: Maven only. 3 for maven-deploy-plugin 3.x (id::url), 2 for 2.x (id::default::url)
+    required: false
+    default: '3'
+  dir:
+    description: Sandbox directory (created). Gradle writes into <dir>/<repository name>; Maven and sbt write into <dir>.
+    required: false
+    default: ''
+  repository-id:
+    description: Maven server id used for the sandbox repository
+    required: false
+    default: adrm-sandbox
+outputs:
+  dir:
+    description: Sandbox directory
+    value: ${{ steps.setup.outputs.dir }}
+runs:
+  using: composite
+  steps:
+    - id: setup
+      shell: bash
+      env:
+        TOOL: ${{ inputs.tool }}
+        MAJOR: ${{ inputs.deploy-plugin-major }}
+        DIR_INPUT: ${{ inputs.dir }}
+        REPO_ID: ${{ inputs.repository-id }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        dir="${DIR_INPUT:-$RUNNER_TEMP/adrm-sandbox}"
+        mkdir -p "$dir"
+        if [ -n "$(ls -A "$dir")" ]; then echo "::error::sandbox directory is not empty: $dir"; exit 1; fi
+        case "$TOOL" in
+          maven)
+            case "$MAJOR" in
+              3) alt="${REPO_ID}::file://$dir" ;;
+              2) alt="${REPO_ID}::default::file://$dir" ;;
+              *) echo "::error::deploy-plugin-major must be 2 or 3"; exit 1 ;;
+            esac
+            echo "MAVEN_OPTS=${MAVEN_OPTS:-} -DaltDeploymentRepository=$alt -DaltReleaseDeploymentRepository=$alt -DaltSnapshotDeploymentRepository=$alt" >> "$GITHUB_ENV"
+            ;;
+          gradle)
+            mkdir -p "$HOME/.gradle/init.d"
+            cp "$ACTION_PATH/../../gradle/adrm-sandbox.init.gradle" "$HOME/.gradle/init.d/adrm-sandbox.init.gradle"
+            echo "ADRM_SANDBOX_DIR=$dir" >> "$GITHUB_ENV"
+            ;;
+          sbt)
+            mkdir -p "$HOME/.sbt/1.0/plugins"
+            cp "$ACTION_PATH/../../sbt/AdrmSandbox.scala" "$HOME/.sbt/1.0/plugins/AdrmSandbox.scala"
+            echo "ADRM_SANDBOX_DIR=$dir" >> "$GITHUB_ENV"
+            ;;
+          *) echo "::error::tool must be maven, gradle or sbt"; exit 1 ;;
+        esac
+        echo "dir=$dir" >> "$GITHUB_OUTPUT"
+        echo "ADRM sandbox for $TOOL: $dir"

@@ -1,0 +1,59 @@
+# Regenerates .readiness/publication.yaml for a Maven project (example: Ozone).
+# The publish command is the one from publish.yml; the sandbox action redirects deployment to a local
+# directory, and `packages: read` guarantees that nothing can be uploaded even if the redirect were lost.
+name: Publication manifest
+on:
+  workflow_dispatch:
+  pull_request:
+    paths: ['**/pom.xml', '.github/workflows/publish.yml', '.readiness/publication.yaml']
+
+permissions:
+  contents: write
+  pull-requests: write
+  packages: read
+
+jobs:
+  manifest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: maven
+          server-id: arenadata
+          server-username: GITHUB_ACTOR
+          server-password: GITHUB_TOKEN
+      - name: Redirect the publisher to a sandbox
+        id: sandbox
+        uses: arenadata/adrm-checks/actions/sandbox@<commit sha of adrm-checks>
+        with:
+          tool: maven
+          deploy-plugin-major: '3'   # '2' for projects on maven-deploy-plugin 2.x (e.g. Apache parent POM 18)
+      - name: Run the publisher exactly as publish.yml does
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MAVEN_ARGS: --batch-mode --show-version --errors --no-transfer-progress --settings ${{ github.workspace }}/dev-support/ci/maven-settings.xml
+          OZONE_DEPLOY_ARGS: -Pdist -Psrc -DskipTests -DskipDocs -DskipRecon -Dmaven.javadoc.skip=true -Djacoco.skip -Drocks_tools_native -DdeployAtEnd=true
+        run: mvn ${{ env.MAVEN_ARGS }} clean package org.apache.maven.plugins:maven-deploy-plugin:3.1.4:deploy ${{ env.OZONE_DEPLOY_ARGS }}
+      - name: Generate the manifest from the sandbox
+        id: manifest
+        uses: arenadata/adrm-checks/actions/manifest@<commit sha of adrm-checks>
+        with:
+          sandbox: ${{ steps.sandbox.outputs.dir }}
+          invocations: '1'
+      - name: Open a pull request when the module/file set changed
+        if: steps.manifest.outputs.changed == 'true' && github.event_name == 'workflow_dispatch'
+        uses: peter-evans/create-pull-request@v7   # pin to a SHA in the project
+        with:
+          branch: readiness/publication-manifest
+          title: 'readiness: refresh publication manifest'
+          commit-message: 'readiness: refresh publication manifest from the publisher sandbox'
+          body: 'The module/file set produced by the publisher differs from .readiness/publication.yaml. Review the diff: added entries are new publications, removed entries are publications that disappeared.'
+      - name: Fail the pull request check when the manifest is stale
+        if: steps.manifest.outputs.changed == 'true' && github.event_name == 'pull_request'
+        run: |
+          git --no-pager diff -- .readiness/publication.yaml
+          echo "::error::.readiness/publication.yaml is stale; regenerate it (see adrm-checks README)"; exit 1

@@ -1,0 +1,128 @@
+# Reusable workflow called by a project's thin wrapper (see examples/release-readiness.yml).
+# Runs in the caller's context: its GITHUB_TOKEN (packages: read), its repository, its workflow SHA.
+# mode=check (default): reads .readiness/publication.yaml from the caller repository at the caller's workflow
+#   revision, runs `emit` from this repository at the called-workflow revision, uploads result.json for ADRM.
+# mode=inspect: ADRM dispatched the wrapper on a line branch; runs `line` on that branch head and uploads
+#   line.json (the declared project version) for ADRM. Nothing is built in either mode.
+name: Publication readiness (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      mode: { type: string, required: false, default: check }
+      request_id: { type: string, required: true }
+      generation: { type: string, required: true }
+      product_version: { type: string, required: true }
+      expected_checker_sha: { type: string, required: true }
+      target_tag: { type: string, required: false, default: '' }
+      target_sha: { type: string, required: false, default: '' }
+      target_version: { type: string, required: false, default: '' }
+      line_version: { type: string, required: false, default: '' }
+      expected_head_sha: { type: string, required: false, default: '' }
+      manifest: { type: string, required: false, default: .readiness/publication.yaml }
+      node-version: { type: string, required: false, default: '24' }
+
+jobs:
+  publication:
+    if: inputs.mode != 'inspect'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout the project manifest at the caller workflow revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: project
+          persist-credentials: false
+          fetch-depth: 1
+          sparse-checkout: .readiness
+      - name: Checkout adrm-checks at the called workflow revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: arenadata/adrm-checks
+          ref: ${{ github.job_workflow_sha }}
+          path: adrm-checks
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ inputs.node-version }}
+      - name: Check publication against the manifest
+        if: always()
+        env:
+          REQUEST_ID: ${{ inputs.request_id }}
+          GENERATION: ${{ inputs.generation }}
+          TARGET_TAG: ${{ inputs.target_tag }}
+          TARGET_SHA: ${{ inputs.target_sha }}
+          TARGET_VERSION: ${{ inputs.target_version }}
+          PRODUCT_VERSION: ${{ inputs.product_version }}
+          EXPECTED_CHECKER_SHA: ${{ inputs.expected_checker_sha }}
+          GITHUB_WORKFLOW_REF: ${{ github.workflow_ref }}
+          GITHUB_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
+          ADRM_ENGINE_SHA: ${{ github.job_workflow_sha }}
+          GITHUB_TOKEN: ${{ github.token }}
+          PACKAGE_TOKEN: ${{ github.token }}
+          CHECKER_SETUP_STATUS: ${{ job.status }}
+          RESULT_PATH: ${{ github.workspace }}/result.json
+        run: node adrm-checks/src/publication-manifest.mjs emit --manifest "project/${{ inputs.manifest }}" --out "$RESULT_PATH"
+      - name: Upload report including diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-readiness-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: result.json
+          if-no-files-found: error
+          retention-days: 7
+
+  line:
+    if: inputs.mode == 'inspect'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      # Cone-mode sparse checkout always includes the root files, so pom.xml, gradle.properties, version.txt,
+      # build.gradle(.kts), version.sbt and build.sbt of the branch head are present without a full clone.
+      - name: Checkout the line branch head (build files only)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: project
+          persist-credentials: false
+          fetch-depth: 1
+          sparse-checkout: .readiness
+      - name: Checkout adrm-checks at the called workflow revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: arenadata/adrm-checks
+          ref: ${{ github.job_workflow_sha }}
+          path: adrm-checks
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ inputs.node-version }}
+      - name: Report the declared project version of the branch head
+        if: always()
+        env:
+          REQUEST_ID: ${{ inputs.request_id }}
+          GENERATION: ${{ inputs.generation }}
+          PRODUCT_VERSION: ${{ inputs.product_version }}
+          LINE_VERSION: ${{ inputs.line_version }}
+          EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+          EXPECTED_CHECKER_SHA: ${{ inputs.expected_checker_sha }}
+          GITHUB_WORKFLOW_REF: ${{ github.workflow_ref }}
+          GITHUB_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
+          CHECKER_SETUP_STATUS: ${{ job.status }}
+          RESULT_PATH: ${{ github.workspace }}/line.json
+        run: node adrm-checks/src/publication-manifest.mjs line --from project --out "$RESULT_PATH"
+      - name: Upload line state
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: line-state-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: line.json
+          if-no-files-found: error
+          retention-days: 7
