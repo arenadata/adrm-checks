@@ -17,8 +17,8 @@
 //   .pom .jar -sources.jar -tests.jar -cyclonedx.json .module -bin.tar.gz .jar.asc
 // so the URL of a file is always <registry>/<group path>/<artifactId>/<version>/<artifactId>-<version><suffix>.
 
-import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from 'node:fs';
-import { join, relative, sep } from 'node:path';
+import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync } from 'node:fs';
+import { dirname, join, relative, sep } from 'node:path';
 import { createHash } from 'node:crypto';
 
 const CHECKSUM_SUFFIXES = ['.md5', '.sha1', '.sha256', '.sha512'];
@@ -217,6 +217,7 @@ function writeManifest(out, manifest, warnings, opts) {
     changed = diff.length > 0;
     if (changed) console.error(`Manifest changed:\n  ${diff.join('\n  ')}`); else console.error('Manifest unchanged (groups identical; provenance refreshed).');
   }
+  mkdirSync(dirname(out), { recursive: true }); // first generation in a project without .readiness yet
   writeFileSync(out, text);
   const g = manifest.generated;
   console.error(`Wrote ${out}: ${g.modules} modules, ${g.primaryFiles} primary files, ${g.checksumFiles ?? 'n/a'} checksum files, method ${g.method}, groups digest ${digest.slice(0, 12)}`);
