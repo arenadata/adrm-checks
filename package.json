@@ -1,11 +1,12 @@
 {
   "name": "@arenadata/adrm-checks",
   "version": "0.1.0",
-  "description": "Publication readiness checks for ADRM: manifest generation from the publisher sandbox, registry verification, result.json for ADRM",
+  "description": "Publication readiness checks for ADRM: manifest generation from the publisher sandbox, registry verification, result.json, line.json and the dependency inventory (dependencies.json) for ADRM",
   "type": "module",
   "private": true,
   "bin": {
-    "adrm-publication-manifest": "src/publication-manifest.mjs"
+    "adrm-publication-manifest": "src/publication-manifest.mjs",
+    "adrm-dependency-inventory": "src/dependency-inventory.mjs"
   },
   "scripts": {
     "test": "node --test \"test/*.test.mjs\""

@@ -1,7 +1,9 @@
 # adrm-checks
 
 Shared publication check tooling for ADRM. A project keeps only the publication manifest `.readiness/publication.yaml`
-and a thin wrapper workflow; everything else lives here and is pulled in by a pinned commit SHA.
+and a thin wrapper workflow; everything else lives here and is pulled in by a pinned commit SHA. The same wrapper also
+reports the declared project version of a line branch (`inspect` mode) and the dependency graph of its head
+(`dependencies` mode), so ADRM never reads build files itself.
 
 The expected publication contents are taken from the project's own publisher, run in a sandbox (publishing is
 redirected into a local directory), and stored as a list of files without versions. At check time the version is
@@ -38,10 +40,12 @@ by ADRM; the report does not assert it.
 
 2. **Add the wrapper** `.github/workflows/release-readiness.yml` from `examples/release-readiness.yml`, replacing
    `<commit sha of adrm-checks>` with the pinned SHA of this repository. The wrapper contains no logic: only the ADRM
-   inputs and the `uses:` of the reusable workflow.The wrapper must exist on
-   the default branch and on every line branch: ADRM
-   dispatches it on the default branch to check the artifacts of a tag and on the line branch to inspect the declared
-   version (see "Line branch inspection").
+   inputs, the `uses:` of the reusable workflow and the static `build_*` values of the project for the dependency
+   inventory (build tool, launcher, JDK, the flags and profiles of `publish.yml`, the Maven server ids; see "Dependency
+   inventory"). The wrapper must exist on the default branch and on every line branch: ADRM dispatches it on the default
+   branch to check the artifacts of a tag and on the line branch to inspect the declared version and to read the
+   dependency graph. Check the build values once before the first run:
+   `node src/dependency-inventory.mjs run --tool maven --command mvn --args-file args.txt --from <checkout> --out /tmp/adrm-dependencies`.
 
 3. **Add the regeneration** `.github/workflows/publication-manifest.yml` from `examples/publication-manifest-maven.yml`,
    `-gradle.yml` or `-sbt.yml`: the same publish commands as in `publish.yml`, the `sandbox` action before them and the
@@ -109,8 +113,8 @@ version is set, the tag is prepared, the artifacts are published. ADRM does not 
 itself: it runs the same wrapper on the line branch with `mode: inspect` (inputs `request_id`, `generation`,
 `product_version`, `line_version`, `expected_head_sha`, `expected_checker_sha`), the reusable workflow runs `line` on a
 checkout of the branch head and uploads the `line-state-<request_id>-<attempt>` artifact with `line.json` (schema
-`adrm/line-state/v1`). The wrapper picks the run name by mode, `publication / <request_id>` or `line / <request_id>`,
-and ADRM finds the run by it. If the branch head already carries a tag that matches the ADRM tag template, ADRM takes
+`adrm/line-state/v1`). The wrapper picks the run name by mode, `publication / <request_id>`, `line / <request_id>` or
+`dependencies / <request_id>`, and ADRM finds the run by it. If the branch head already carries a tag that matches the ADRM tag template, ADRM takes
 the version from the tag and does not start an inspection.
 
 How it works step by step (one run per branch head; a new head → a new inspection):
@@ -185,6 +189,99 @@ the `<project>` itself, not from `<parent>`), `gradle.properties` (`version=`), 
 version counts as set or as not bumped is decided by ADRM: the project version must start with the row's line, the
 product version must match the release's, and the expected tag is the tag template filled with these components.
 
+## Dependency inventory (`dependencies` mode)
+
+ADRM compares dependency versions across the projects of a release: a fork's dependency on another fork against the
+version the release targets for that fork, and third-party libraries (guava, netty, protobuf …) across all projects.
+The facts come from the build itself. ADRM runs the same wrapper on the line branch with `mode: dependencies` (inputs
+`request_id`, `generation`, `product_version`, `line_version`, `expected_head_sha`, `expected_checker_sha`; run
+name `dependencies / <request_id>`), the reusable workflow resolves the dependency graph of the branch head and
+uploads the `dependency-inventory-<request_id>-<attempt>` artifact with `dependencies.json` (schema
+`adrm/dependency-inventory/v1`). One inventory per branch head: ADRM starts a new one when the head moves or on request.
+
+Nothing is compiled or published. Maven runs `maven-dependency-plugin:3.11.0:tree` in every module: the goal collects
+POMs and downloads no jars, so a fresh checkout at an unpublished version works, sibling `test-jar` dependencies
+included. Gradle runs the `adrmDependencies` task of `gradle/adrm-dependencies.init.gradle`, which reads the
+resolution result of the `compileClasspath` and `runtimeClasspath` configurations of every project (the main source
+set; metadata only, no artifacts). Test, integration and jmh classpaths are left out: on Iceberg they multiply the graph
+six times without changing what ships; a `build_args` line with `-Padrm.configurations=<regex>` widens the set. The
+commands, one per line of `build_args`:
+
+```sh
+<mvn> -B -ntp -fae -T 1C -Dscan=false <build_args line> org.apache.maven.plugins:maven-dependency-plugin:3.11.0:tree -DoutputType=json -DoutputFile=target/adrm-dependency-tree.json -DoutputEncoding=UTF-8
+<gradlew> --init-script gradle/adrm-dependencies.init.gradle --no-configuration-cache --continue <build_args line> adrmDependencies
+```
+
+The wrapper carries the project's static values: `build_tool` (`maven`, `gradle` or `sbt`), `build_command` (`mvn`,
+`./mvnw`, `./build/mvn`, `./gradlew`), `java_version` (Maven: the publisher's JDK, because JDK-activated profiles change
+the graph; Gradle: the highest JDK the publisher uses), `java_distribution`, `maven_server_ids` (the server ids the
+build resolves from; each gets the workflow token in `~/.m2/settings.xml`) and `build_args` (the flags and profiles of
+`publish.yml`, one invocation per line, no goals or tasks, no quoting). Several invocations (the Scala and Flink
+variants of Iceberg) merge into one inventory by module coordinates. The job restores no Maven cache: the runner's
+`~/.m2` is empty, so `mavenLocal()` (first in Iceberg's repositories) cannot shadow the registries.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant ADRM as ADRM (worker)
+    participant GH as GitHub API
+    participant WF as release-readiness.yml wrapper on the line branch
+    participant RW as adrm-checks reusable workflow job dependencies
+    participant S as dependency-inventory.mjs
+    ADRM->>GH: discovery: the line branch and its head
+    ADRM->>GH: POST …/release-readiness.yml/dispatches, ref = line branch, mode=dependencies
+    GH->>WF: run from the branch head, run-name "dependencies / request_id"
+    WF->>RW: uses …/publication-readiness.yml@sha, inputs plus the static build values
+    RW->>RW: full checkout of the head, JDK, Maven servers with the workflow token
+    RW->>S: run: the build tool once per build_args line, graph resolution only
+    S->>S: harvest target/adrm-dependency-tree.json or build/adrm-dependencies.json of every module, normalize
+    RW->>S: report: envelope with the expected head and wrapper SHA, inventory state
+    S-->>RW: dependencies.json
+    RW-->>GH: artifact dependency-inventory-request_id-attempt
+    ADRM->>GH: download, validate, store modules, components and edges, compare across the release
+```
+
+The report:
+
+```json
+{
+  "schemaVersion": 1,
+  "executionMode": "live",
+  "requestId": "<uuid>",
+  "generation": 1,
+  "repository": { "provider": "github", "id": 413321535, "fullName": "arenadata/hive" },
+  "commit": { "ref": "refs/heads/develop/4.5.0/4.3.0", "sha": "<sha>", "state": "resolved" },
+  "checker": { "workflowRef": "arenadata/hive/.github/workflows/release-readiness.yml@refs/heads/develop/4.5.0/4.3.0", "workflowSha": "<sha>", "runId": 1, "runAttempt": 1, "runUrl": "https://github.com/arenadata/hive/actions/runs/1" },
+  "checkedAt": "2026-11-03T12:00:00.000Z",
+  "inventory": {
+    "state": "complete",
+    "tool": "maven",
+    "invocations": [ { "command": "mvn -B -ntp -fae -T 1C -Dscan=false -DskipTests org.apache.maven.plugins:maven-dependency-plugin:3.11.0:tree -DoutputType=json -DoutputFile=target/adrm-dependency-tree.json -DoutputEncoding=UTF-8", "exitCode": 0, "durationMs": 412000 } ],
+    "modules":    [ { "id": 0, "group": "org.apache.hive", "name": "hive-common", "version": "4.3.0.3-4.5.0-0", "path": "common/pom.xml", "packaging": "jar" } ],
+    "components": [ { "id": 0, "group": "org.apache.hadoop", "name": "hadoop-common", "version": "3.4.3.2-4.4.0-1", "type": "jar", "classifier": null } ],
+    "edges":      [ { "module": 0, "component": 0, "scope": "compile", "configuration": null, "optional": false, "direct": true, "via": null } ],
+    "counts":     { "modules": 57, "components": 1480, "edges": 17100, "invocations": 1, "failedInvocations": 0 },
+    "errors":     []
+  }
+}
+```
+
+`commit.state`: `resolved`; `changed` (the head moved: the actual SHA is in `sha`, nothing was built); `missing`.
+`inventory.state`: `complete`; `partial` (modules were read, but an invocation exited with an error, a module file was
+not parsed or a Gradle configuration has unresolved entries, see `errors[]`); `error` (no module could be read, or a
+gate stopped the run before the build); `unsupported` (sbt). Error codes: `INPUT_INVALID`, `HEAD_CHANGED`,
+`CHECKER_CHANGED`, `CHECKER_SETUP_ERROR`, `TOOL_UNSUPPORTED`, `INVOCATION_FAILED`, `RESOLUTION_INCOMPLETE`,
+`TREE_PARSE_ERROR`, `NO_MODULES`, `REPORT_TOO_LARGE` (over 16 MiB: the envelope is kept, the graph is dropped).
+`modules` are the project's own modules (from them ADRM learns which coordinates the project publishes), `components`
+the resolved dependencies, `edges` one per module and graph node: Maven `scope` from the tree, Gradle `configuration`;
+`direct` means declared by the module, otherwise `via` is the parent component. Ids are array indexes and the order is
+deterministic. ADRM interprets the versions with the templates of the repository that publishes the coordinate; the
+script never parses them.
+
+What the inventory cannot see: classes relocated by shading (the inputs of a shade module are listed, their bundled
+copies are not), dependencies of profiles missing from `build_args`, and anything resolved outside the project's build.
+The Maven graph follows the JDK of `java_version` (JDK-activated profiles).
+
 ## Local usage
 
 ```sh
@@ -202,6 +299,13 @@ node src/publication-manifest.mjs emit --manifest .readiness/publication.yaml --
 `node src/publication-manifest.mjs line --from . --version-only` prints the file and the version that the branch
 inspection will see, without the ADRM inputs; `line --from DIR --out line.json` with the same environment variables as
 in the workflow (`GITHUB_REF_NAME`, `GITHUB_SHA`, `EXPECTED_HEAD_SHA` instead of `TARGET_*`) writes the full `line.json`.
+
+Dependency inventory by hand: `node src/dependency-inventory.mjs run --tool maven --command mvn --args-file args.txt --from <checkout> --out /tmp/adrm-dependencies`
+runs the build tool once per line of `args.txt` and writes `/tmp/adrm-dependencies/inventory.json`;
+`normalize --tool maven --from <checkout> --out inventory.json` normalizes the `target/adrm-dependency-tree.json` files
+left by a manual `mvn … dependency:tree` run (Gradle: `build/adrm-dependencies.json` left by `adrmDependencies`);
+`report --inventory inventory.json --out dependencies.json --execution-mode fixture` with the environment variables of
+`line` plus `BUILD_TOOL` writes the full `dependencies.json`.
 
 `emit --execution-mode fixture` marks the report as local: ADRM will not accept it as live.
 `--simulate <file>:missing,<file>:error` forces the observation of a single file and works only in fixture mode; this is
@@ -222,7 +326,9 @@ for this.
 - The file set is determined by the project's publisher; a file the publisher never even tried to publish cannot be
   discovered by any automatic means, which is why the manifest is reviewed by people and regeneration shows entries that
   have disappeared.
-- Cross-project dependencies are not checked: `dependencies.outcome` in `result.json` is always `not_supported`.
+- `emit` does not check dependencies: `dependencies.outcome` in `result.json` stays `not_supported`. Dependencies are
+  read by the separate `dependencies` mode and compared by ADRM; the inventory does not cover sbt, shaded contents or
+  profiles missing from `build_args`.
 - sbt: the standard `publish` task is redirected; `publishSigned` (sbt-pgp), sbt-sonatype and custom publish tasks are
   not covered, Ivy-style publishing is not supported.
 - The inspection reads the version only from the listed build files; a version computed by the build itself (for

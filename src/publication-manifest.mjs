@@ -20,22 +20,10 @@
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync } from 'node:fs';
 import { dirname, join, relative, sep } from 'node:path';
 import { createHash } from 'node:crypto';
+import { parseArgs, SHA, UUID, readBranchDispatch, dispatchGate } from './lib/contract.mjs';
 
 const CHECKSUM_SUFFIXES = ['.md5', '.sha1', '.sha256', '.sha512'];
 const API = 'https://api.github.com';
-
-function parseArgs(argv) {
-  const [command, ...rest] = argv;
-  const opts = {};
-  for (let i = 0; i < rest.length; i++) {
-    const a = rest[i];
-    if (!a.startsWith('--')) throw new Error(`Unexpected argument: ${a}`);
-    const key = a.slice(2);
-    const next = rest[i + 1];
-    if (next === undefined || next.startsWith('--')) opts[key] = true; else { opts[key] = next; i++; }
-  }
-  return { command, opts };
-}
 
 function token() {
   const t = process.env.PACKAGE_TOKEN || process.env.GITHUB_TOKEN;
@@ -339,7 +327,6 @@ async function observeManifest(manifest, version, concurrency, simulate = new Ma
 // GITHUB_WORKFLOW_REF, GITHUB_WORKFLOW_SHA, EXPECTED_CHECKER_SHA, GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT,
 // CHECKER_SETUP_STATUS, RESULT_PATH; GITHUB_TOKEN for the API, PACKAGE_TOKEN for the registry.
 // The report never claims readiness itself: ADRM recomputes it from target state, inventory and observations.
-const SHA = /^[0-9a-f]{40}$/, UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // Tag, project and product versions are shaped by ADRM templates (configurable per repository); only path-safe characters matter here.
 const SAFE_VERSION = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,255}$/;
 
@@ -557,28 +544,13 @@ async function line(opts) {
   const resultPath = opts.out || env.RESULT_PATH || 'line.json';
   const executionMode = opts['execution-mode'] || 'live';
   if (!['live', 'fixture'].includes(executionMode)) throw new Error('--execution-mode must be live or fixture');
-  const inputs = {
-    requestId: env.REQUEST_ID ?? '', generation: Number(env.GENERATION), repository: env.GITHUB_REPOSITORY ?? '', repositoryId: Number(env.GITHUB_REPOSITORY_ID),
-    branch: env.GITHUB_REF_NAME ?? '', headSha: env.GITHUB_SHA ?? '', expectedHeadSha: env.EXPECTED_HEAD_SHA ?? '',
-    checker: { workflowRef: env.GITHUB_WORKFLOW_REF ?? '', workflowSha: env.GITHUB_WORKFLOW_SHA ?? '', expectedSha: env.EXPECTED_CHECKER_SHA ?? '', runId: Number(env.GITHUB_RUN_ID), runAttempt: Number(env.GITHUB_RUN_ATTEMPT) },
-  };
-  const invalid = [];
-  if (!UUID.test(inputs.requestId)) invalid.push('request_id');
-  if (!Number.isSafeInteger(inputs.generation) || inputs.generation < 0) invalid.push('generation');
-  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(inputs.repository) || !Number.isSafeInteger(inputs.repositoryId) || inputs.repositoryId <= 0) invalid.push('repository identity');
-  if (!inputs.branch || inputs.branch.length > 256 || inputs.branch.startsWith('refs/')) invalid.push('branch');
-  if (!SHA.test(inputs.headSha) || !SHA.test(inputs.expectedHeadSha)) invalid.push('head sha');
-  if (!SHA.test(inputs.checker.workflowSha) || !SHA.test(inputs.checker.expectedSha)) invalid.push('checker sha');
-  if (!inputs.checker.workflowRef.startsWith(`${inputs.repository}/.github/workflows/`) || !/@refs\/(heads|tags)\/[^\s]+$/.test(inputs.checker.workflowRef) || inputs.checker.workflowRef.length > 1024) invalid.push('workflow_ref');
-  if (!Number.isSafeInteger(inputs.checker.runId) || inputs.checker.runId <= 0 || !Number.isSafeInteger(inputs.checker.runAttempt) || inputs.checker.runAttempt <= 0) invalid.push('run identity');
-
-  const headSha = SHA.test(inputs.headSha) ? inputs.headSha : null;
+  const d = readBranchDispatch(env);
   const state = {
-    schemaVersion: 1, executionMode, requestId: inputs.requestId, generation: inputs.generation,
-    repository: { provider: 'github', id: inputs.repositoryId, fullName: inputs.repository },
-    branch: { name: inputs.branch || 'unknown', headSha, state: !headSha ? 'missing' : headSha === inputs.expectedHeadSha ? 'resolved' : 'changed' },
+    schemaVersion: 1, executionMode, requestId: d.inputs.requestId, generation: d.inputs.generation,
+    repository: d.repository,
+    branch: { name: d.inputs.branch || 'unknown', headSha: d.headSha, state: d.branchState },
     version: { state: 'undeclared', value: null, source: { tool: null, path: null, method: null }, errors: [] },
-    checker: { workflowRef: inputs.checker.workflowRef, workflowSha: inputs.checker.workflowSha, runId: inputs.checker.runId, runAttempt: inputs.checker.runAttempt, runUrl: `https://github.com/${inputs.repository}/actions/runs/${inputs.checker.runId}` },
+    checker: d.checker,
     checkedAt: new Date().toISOString(),
   };
   const fail = (code, message, retryable = false) => { state.version = { state: 'error', value: null, source: { tool: null, path: null, method: null }, errors: [{ code, message: message.slice(0, 4096), retryable }] }; };
@@ -587,10 +559,8 @@ async function line(opts) {
     writeFileSync(resultPath, JSON.stringify(state, null, 1));
     console.error(`line.json written to ${resultPath}: ${JSON.stringify({ branch: state.branch.state, version: state.version.state, value: state.version.value, source: state.version.source.path, errors: state.version.errors.map(e => e.code) })}`);
   };
-  if (invalid.length) { fail('INPUT_INVALID', `Некорректные входные данные workflow: ${invalid.join(', ')}.`); finish(); return; }
-  if (state.branch.state === 'changed') { fail('HEAD_CHANGED', `Голова ветки ${inputs.branch} (${headSha.slice(0, 7)}) отличается от ожидаемой ADRM; версия не читалась.`, true); finish(); return; }
-  if (inputs.checker.workflowSha !== inputs.checker.expectedSha) { fail('CHECKER_CHANGED', 'Версия проверяющего workflow отличается от ожидаемой ADRM; версия не читалась.', true); finish(); return; }
-  if (env.CHECKER_SETUP_STATUS && env.CHECKER_SETUP_STATUS !== 'success') { fail('CHECKER_SETUP_ERROR', 'Подготовительный шаг workflow завершился с ошибкой; build-файлы не читались.', true); finish(); return; }
+  const gate = dispatchGate(d, env, { skipped: 'версия не читалась', setupSkipped: 'build-файлы не читались' });
+  if (gate) { fail(gate.code, gate.message, gate.retryable); finish(); return; }
   try {
     const declared = readDeclaredVersion(dir);
     state.version = declared

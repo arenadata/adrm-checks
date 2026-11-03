@@ -4,6 +4,10 @@
 #   revision, runs `emit` from this repository at the called-workflow revision, uploads result.json for ADRM.
 # mode=inspect: ADRM dispatched the wrapper on a line branch; runs `line` on that branch head and uploads
 #   line.json (the declared project version) for ADRM. Nothing is built in either mode.
+# mode=dependencies: ADRM dispatched the wrapper on a line branch; resolves the dependency graph of the branch head
+#   from the build itself (Maven dependency:tree in JSON per module, Gradle init-script task over the resolution
+#   result; nothing is compiled or published) with the project's static build_* values from the wrapper, and uploads
+#   dependencies.json for ADRM.
 name: Publication readiness (reusable)
 
 on:
@@ -21,10 +25,17 @@ on:
       expected_head_sha: { type: string, required: false, default: '' }
       manifest: { type: string, required: false, default: .readiness/publication.yaml }
       node-version: { type: string, required: false, default: '24' }
+      # mode=dependencies: static values of the project, copied from its publisher workflow (see the wrapper example)
+      build_tool: { type: string, required: false, default: '' }             # maven | gradle | sbt
+      build_command: { type: string, required: false, default: '' }          # mvn | ./mvnw | ./build/mvn | ./gradlew
+      build_args: { type: string, required: false, default: '' }             # one invocation per line: flags and profiles only
+      java_version: { type: string, required: false, default: '' }
+      java_distribution: { type: string, required: false, default: temurin }
+      maven_server_ids: { type: string, required: false, default: arenadata } # server ids the build resolves from, comma-separated
 
 jobs:
   publication:
-    if: inputs.mode != 'inspect'
+    if: inputs.mode == 'check'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -124,5 +135,104 @@ jobs:
         with:
           name: line-state-${{ inputs.request_id }}-${{ github.run_attempt }}
           path: line.json
+          if-no-files-found: error
+          retention-days: 7
+
+  dependencies:
+    if: inputs.mode == 'dependencies'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout the line branch head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: project
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Checkout adrm-checks at the called workflow revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: arenadata/adrm-checks
+          ref: ${{ github.job_workflow_sha }}
+          path: adrm-checks
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ inputs.node-version }}
+      # No Maven cache: a fresh ~/.m2 keeps mavenLocal() (first in Iceberg's repositories) empty, so the graph is what
+      # the registries serve.
+      - name: Set up Java
+        if: inputs.build_tool == 'maven' || inputs.build_tool == 'gradle'
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: ${{ inputs.java_distribution }}
+          java-version: ${{ inputs.java_version }}
+      - name: Set up Gradle
+        if: inputs.build_tool == 'gradle'
+        uses: gradle/actions/setup-gradle@af1da67850ed9a4cedd57bfd976089dd991e2582
+        with:
+          cache-read-only: true
+          add-job-summary: on-failure
+      # setup-java always writes ~/.m2/settings.xml (server id github); the build resolves from the registries whose
+      # server ids are listed here, all with the workflow token (GitHub Packages requires a token even to read).
+      - name: Configure Maven servers
+        if: inputs.build_tool == 'maven'
+        env:
+          SERVER_IDS: ${{ inputs.maven_server_ids }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.m2
+          {
+            echo '<settings><servers>'
+            IFS=, read -ra ids <<< "$SERVER_IDS"
+            for id in "${ids[@]}"; do
+              id="${id// /}"
+              [ -z "$id" ] && continue
+              [[ "$id" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::invalid Maven server id: $id"; exit 1; }
+              printf '<server><id>%s</id><username>${env.GITHUB_ACTOR}</username><password>${env.GITHUB_TOKEN}</password></server>\n' "$id"
+            done
+            echo '</servers></settings>'
+          } > ~/.m2/settings.xml
+      # A stale dispatch (the head or the wrapper moved) is reported by `report` as HEAD_CHANGED / CHECKER_CHANGED
+      # without running the build.
+      - name: Resolve the dependency graph from the build
+        id: inventory
+        if: inputs.expected_head_sha == github.sha && inputs.expected_checker_sha == github.workflow_sha
+        uses: ./adrm-checks/actions/dependencies
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_USERNAME: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          tool: ${{ inputs.build_tool }}
+          command: ${{ inputs.build_command }}
+          args: ${{ inputs.build_args }}
+          from: project
+          out: ${{ runner.temp }}/adrm-dependencies
+      - name: Report the dependency inventory
+        if: always()
+        env:
+          REQUEST_ID: ${{ inputs.request_id }}
+          GENERATION: ${{ inputs.generation }}
+          PRODUCT_VERSION: ${{ inputs.product_version }}
+          LINE_VERSION: ${{ inputs.line_version }}
+          EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+          EXPECTED_CHECKER_SHA: ${{ inputs.expected_checker_sha }}
+          GITHUB_WORKFLOW_REF: ${{ github.workflow_ref }}
+          GITHUB_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
+          CHECKER_SETUP_STATUS: ${{ job.status }}
+          BUILD_TOOL: ${{ inputs.build_tool }}
+          RESULT_PATH: ${{ github.workspace }}/dependencies.json
+        run: node adrm-checks/src/dependency-inventory.mjs report --inventory "${{ runner.temp }}/adrm-dependencies/inventory.json" --out "$RESULT_PATH"
+      - name: Upload the dependency inventory
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dependency-inventory-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: dependencies.json
           if-no-files-found: error
           retention-days: 7

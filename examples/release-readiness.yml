@@ -1,14 +1,15 @@
 # Projects that run a license check (apache-rat in Apache forks): keep the project's own license header above this comment, copied from publish.yml.
 # Thin wrapper to place in the project at .github/workflows/release-readiness.yml. It must exist on the default
 # branch (GitHub dispatches from there) and on every line branch: ADRM dispatches it on the line branch itself
-# in mode=inspect to learn the declared project version of the branch head.
+# in mode=inspect to learn the declared project version of the branch head and in mode=dependencies to read the
+# resolved dependency graph of the branch head from the build.
 # Pin the reusable workflow to a commit SHA of adrm-checks once it is published.
 name: Release readiness
-run-name: ${{ inputs.mode == 'inspect' && 'line' || 'publication' }} / ${{ inputs.request_id }}
+run-name: ${{ inputs.mode == 'inspect' && 'line' || inputs.mode == 'dependencies' && 'dependencies' || 'publication' }} / ${{ inputs.request_id }}
 on:
   workflow_dispatch:
     inputs:
-      mode: { type: choice, options: [check, inspect], default: check, required: false }
+      mode: { type: choice, options: [check, inspect, dependencies], default: check, required: false }
       request_id: { type: string, required: true }
       generation: { type: string, required: true }
       product_version: { type: string, required: true }
@@ -16,14 +17,14 @@ on:
       target_tag: { type: string, required: false, default: '' }        # mode=check
       target_sha: { type: string, required: false, default: '' }        # mode=check
       target_version: { type: string, required: false, default: '' }    # mode=check
-      line_version: { type: string, required: false, default: '' }      # mode=inspect
-      expected_head_sha: { type: string, required: false, default: '' } # mode=inspect
+      line_version: { type: string, required: false, default: '' }      # mode=inspect, mode=dependencies
+      expected_head_sha: { type: string, required: false, default: '' } # mode=inspect, mode=dependencies
 
 permissions:
   contents: read
   packages: read
 concurrency:
-  group: ${{ inputs.mode == 'inspect' && 'line' || 'publication' }}-${{ inputs.request_id }}
+  group: ${{ inputs.mode == 'inspect' && 'line' || inputs.mode == 'dependencies' && 'dependencies' || 'publication' }}-${{ inputs.request_id }}
   cancel-in-progress: false
 
 jobs:
@@ -40,3 +41,30 @@ jobs:
       target_version: ${{ inputs.target_version }}
       line_version: ${{ inputs.line_version }}
       expected_head_sha: ${{ inputs.expected_head_sha }}
+      # mode=dependencies: static values of this project, copied from its publisher workflow (flags and profiles
+      # only, no goals or tasks). Maven: the publisher's JDK (JDK-activated profiles change the graph). Gradle: the
+      # highest JDK the publisher uses (graph resolution does not depend on it). maven_server_ids: the server ids of
+      # the repositories the build resolves from; each gets the workflow token in ~/.m2/settings.xml.
+      build_tool: maven
+      build_command: mvn
+      java_version: '21'
+      java_distribution: temurin
+      maven_server_ids: arenadata
+      build_args: |
+        -DskipTests -Dmaven.javadoc.skip=true
+      # Examples of the block for other projects:
+      #   Hive 2.3.10 line: build_command mvn, java_version '8', build_args "-DskipTests -Dmaven.javadoc.skip=true"
+      #   Hive 4.3 line: build_command mvn, java_version '21', build_args "-DskipTests -Dmaven.javadoc.skip=true"
+      #   Curator: build_command mvn, java_version '21', maven_server_ids "arenadata,github", build_args "-DskipTests"
+      #   Ozone: build_command mvn, java_version '21', build_args
+      #     "--settings dev-support/ci/maven-settings.xml -Pdist -Psrc -DskipTests -DskipDocs -DskipRecon -Dmaven.javadoc.skip=true -Djacoco.skip -Drocks_tools_native"
+      #   trino-hadoop-apache: build_command mvn, java_version '21', build_args "" (no profiles)
+      #   Spark: build_command ./build/mvn, java_version '17', build_args
+      #     "-Pscala-2.13 -Phadoop-3 -Phive -Phive-thriftserver -Pyarn -Pkubernetes -Pconnect -Phadoop-cloud -DskipTests" (plus -Pvolcano on 4.2)
+      #   Flink: build_command ./mvnw, java_version '21', build_args "-DskipTests"
+      #   Iceberg: build_tool gradle, build_command ./gradlew, java_version '21', build_args (one invocation per line)
+      #     "-DallModules -DknownFlinkVersions=1.19,1.20,2.0"
+      #     "-DflinkVersions= -DsparkVersions=3.4 -DscalaVersion=2.13 -DkafkaVersions="
+      #     "-DflinkVersions= -DsparkVersions=3.5 -DscalaVersion=2.13 -DkafkaVersions="
+      #     "-DflinkVersions=2.2 -DsparkVersions= -DkafkaVersions="
+      #   Kafka: build_tool gradle, build_command ./gradlew, java_version '21', build_args "-PscalaVersion=2.13"

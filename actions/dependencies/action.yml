@@ -1,0 +1,56 @@
+name: ADRM dependency inventory
+description: >
+  Resolves the dependency graph of a checkout from the build itself, without compiling or publishing: Maven runs
+  maven-dependency-plugin 3.11.0 `tree` (JSON per module, POM collection only) and Gradle runs an init-script task
+  that walks the resolution result of every classpath configuration in every project. Each line of `args` is one
+  invocation (the publisher's flags and profiles, no goals or tasks). Writes <out>/inventory.json; the step never
+  fails because of the build: failures land in inventory.state and inventory.errors.
+inputs:
+  tool:
+    description: maven, gradle or sbt (sbt yields state unsupported)
+    required: true
+  command:
+    description: 'Launcher on PATH or relative to the checkout: mvn, ./mvnw, ./build/mvn, ./gradlew (default: ./mvnw or mvn, ./gradlew or gradle)'
+    required: false
+    default: ''
+  args:
+    description: One invocation per line; blank lines and lines starting with # are ignored; no quoting
+    required: false
+    default: ''
+  from:
+    description: Project checkout directory
+    required: false
+    default: '.'
+  out:
+    description: Output directory (created)
+    required: false
+    default: ''
+outputs:
+  state:
+    description: inventory.state (complete, partial, error or unsupported)
+    value: ${{ steps.run.outputs.state }}
+  inventory:
+    description: Path of inventory.json
+    value: ${{ steps.run.outputs.inventory }}
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      env:
+        TOOL: ${{ inputs.tool }}
+        COMMAND: ${{ inputs.command }}
+        ARGS: ${{ inputs.args }}
+        FROM: ${{ inputs.from }}
+        OUT_INPUT: ${{ inputs.out }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        out="${OUT_INPUT:-$RUNNER_TEMP/adrm-dependencies}"
+        mkdir -p "$out"
+        printf '%s\n' "$ARGS" > "$out/args.txt"
+        cmd=(run --tool "$TOOL" --args-file "$out/args.txt" --from "$FROM" --out "$out")
+        if [ -n "$COMMAND" ]; then cmd+=(--command "$COMMAND"); fi
+        node "$ACTION_PATH/../../src/dependency-inventory.mjs" "${cmd[@]}"
+        echo "inventory=$out/inventory.json" >> "$GITHUB_OUTPUT"
+        echo "state=$(node -p 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).state' "$out/inventory.json")" >> "$GITHUB_OUTPUT"
