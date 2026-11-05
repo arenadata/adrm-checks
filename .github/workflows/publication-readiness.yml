@@ -8,6 +8,9 @@
 #   from the build itself (Maven dependency:tree in JSON per module, Gradle init-script task over the resolution
 #   result; nothing is compiled or published) with the project's static build_* values from the wrapper, and uploads
 #   dependencies.json for ADRM.
+# mode=history: ADRM dispatched the wrapper on the current line branch with the predecessor branches in compare_refs;
+#   classifies the commits of the predecessors that the branch head lacks (full clone, upstream release tags as the
+#   boundary, layered evidence; nothing is built or written to refs) and uploads lost-commits.json for ADRM.
 name: Publication readiness (reusable)
 
 on:
@@ -32,6 +35,10 @@ on:
       java_version: { type: string, required: false, default: '' }
       java_distribution: { type: string, required: false, default: temurin }
       maven_server_ids: { type: string, required: false, default: arenadata } # server ids the build resolves from, comma-separated
+      # mode=history: predecessor branches from ADRM, one `<branch>@<sha>` per line; static values of the project
+      compare_refs: { type: string, required: false, default: '' }
+      upstream_repository: { type: string, required: false, default: '' }  # owner/name; default: root of the fork network
+      branch_local_paths: { type: string, required: false, default: '' }   # extra paths that differ between line branches by design
 
 jobs:
   publication:
@@ -234,5 +241,75 @@ jobs:
         with:
           name: dependency-inventory-${{ inputs.request_id }}-${{ github.run_attempt }}
           path: dependencies.json
+          if-no-files-found: error
+          retention-days: 7
+
+  history:
+    if: inputs.mode == 'history'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      # The whole history of every branch: the predecessors arrive as refs/remotes/origin/<branch>.
+      - name: Checkout the full history of the repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: project
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Checkout adrm-checks at the called workflow revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: arenadata/adrm-checks
+          ref: ${{ github.job_workflow_sha }}
+          path: adrm-checks
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ inputs.node-version }}
+      # The upstream release tags bound the candidates: the wrapper's static upstream_repository, else the root of the
+      # fork network (GitHub API `source`), else none.
+      - name: Resolve the upstream repository
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          UPSTREAM_REPOSITORY: ${{ inputs.upstream_repository }}
+        run: node adrm-checks/src/lost-commits.mjs upstream --repository "$GITHUB_REPOSITORY" --override "$UPSTREAM_REPOSITORY" --out "$RUNNER_TEMP/upstream.json"
+      # A stale dispatch (the head or the wrapper moved) is reported by `report` as HEAD_CHANGED / CHECKER_CHANGED
+      # without classifying anything.
+      - name: Classify the commits of the predecessor branches
+        if: inputs.expected_head_sha == github.sha && inputs.expected_checker_sha == github.workflow_sha
+        env:
+          COMPARE_REFS: ${{ inputs.compare_refs }}
+          BRANCH_LOCAL_PATHS: ${{ inputs.branch_local_paths }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$COMPARE_REFS" > "$RUNNER_TEMP/compare-refs.txt"
+          node adrm-checks/src/lost-commits.mjs classify --repo project --current "$GITHUB_REF_NAME@$GITHUB_SHA" \
+            --sources-file "$RUNNER_TEMP/compare-refs.txt" --upstream-file "$RUNNER_TEMP/upstream.json" \
+            --branch-local "$BRANCH_LOCAL_PATHS" --out "$RUNNER_TEMP/history.json"
+      - name: Report the lost commits
+        if: always()
+        env:
+          REQUEST_ID: ${{ inputs.request_id }}
+          GENERATION: ${{ inputs.generation }}
+          PRODUCT_VERSION: ${{ inputs.product_version }}
+          LINE_VERSION: ${{ inputs.line_version }}
+          EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+          EXPECTED_CHECKER_SHA: ${{ inputs.expected_checker_sha }}
+          GITHUB_WORKFLOW_REF: ${{ github.workflow_ref }}
+          GITHUB_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
+          CHECKER_SETUP_STATUS: ${{ job.status }}
+          COMPARE_REFS: ${{ inputs.compare_refs }}
+          RESULT_PATH: ${{ github.workspace }}/lost-commits.json
+        run: node adrm-checks/src/lost-commits.mjs report --history "$RUNNER_TEMP/history.json" --out "$RESULT_PATH"
+      - name: Upload the lost commits report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: lost-commits-${{ inputs.request_id }}-${{ github.run_attempt }}
+          path: lost-commits.json
           if-no-files-found: error
           retention-days: 7

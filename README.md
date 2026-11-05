@@ -2,8 +2,9 @@
 
 Shared publication check tooling for ADRM. A project keeps only the publication manifest `.readiness/publication.yaml`
 and a thin wrapper workflow; everything else lives here and is pulled in by a pinned commit SHA. The same wrapper also
-reports the declared project version of a line branch (`inspect` mode) and the dependency graph of its head
-(`dependencies` mode), so ADRM never reads build files itself.
+reports the declared project version of a line branch (`inspect` mode), the dependency graph of its head
+(`dependencies` mode) and the commits of older line branches that its head lacks (`history` mode), so ADRM never reads
+build files or history itself.
 
 The expected publication contents are taken from the project's own publisher, run in a sandbox (publishing is
 redirected into a local directory), and stored as a list of files without versions. At check time the version is
@@ -43,8 +44,8 @@ by ADRM; the report does not assert it.
    inputs, the `uses:` of the reusable workflow and the static `build_*` values of the project for the dependency
    inventory (build tool, launcher, JDK, the flags and profiles of `publish.yml`, the Maven server ids; see "Dependency
    inventory"). The wrapper must exist on the default branch and on every line branch: ADRM dispatches it on the default
-   branch to check the artifacts of a tag and on the line branch to inspect the declared version and to read the
-   dependency graph. Check the build values once before the first run:
+   branch to check the artifacts of a tag and on the line branch to inspect the declared version, to read the
+   dependency graph and to look for lost commits. Check the build values once before the first run:
    `node src/dependency-inventory.mjs run --tool maven --command mvn --args-file args.txt --from <checkout> --out /tmp/adrm-dependencies`.
 
 3. **Add the regeneration** `.github/workflows/publication-manifest.yml` from `examples/publication-manifest-maven.yml`,
@@ -282,6 +283,128 @@ What the inventory cannot see: classes relocated by shading (the inputs of a sha
 copies are not), dependencies of profiles missing from `build_args`, and anything resolved outside the project's build.
 The Maven graph follows the JDK of `java_version` (JDK-activated profiles).
 
+## Lost commits (`history` mode)
+
+A new line branch is cut for every product release (`develop/4.4.0/4.3.0.2` → `develop/4.5.0/4.3.0`), and the old one
+lives on for hotfixes. A commit that lands only in an old branch is lost for the next release unless it is ported.
+ADRM picks the predecessors of the current line branch by the branch template and runs the wrapper on the current branch
+with `mode: history`. The inputs are the ones of `dependencies` plus `compare_refs`, one `<branch>@<sha>` per
+predecessor. The run is named `history / <request_id>`. The reusable workflow classifies the commits of the
+predecessors in a full clone and uploads the `lost-commits-<request_id>-<attempt>` artifact with `lost-commits.json`
+(schema `adrm/lost-commits/v1`). Nothing is built, pushed or written to refs.
+
+1. **Candidates.** A candidate is a commit reachable from a predecessor, not from the current branch and not from any
+   release tag of the upstream repository that is present in the clone. The upstream repository is the wrapper's
+   `upstream_repository`, otherwise the root of the fork network (`apache/hadoop` for `arenadata/hadoop`, not the
+   parent fork). Its tags come from `git ls-remote --tags`. Tags of the fork itself never count: old Arenadata tags
+   such as `2.0.0_arenadata2` would otherwise turn a whole line into "upstream".
+2. **Upstream base.** The newest upstream tags that are ancestors of a branch are its upstream base, listed in
+   `upstreamBaseTags`. Excluding every present upstream tag, not only the base, also removes upstream commits that a
+   line picked up after its base tag but that a later upstream release contains. Their number is `upstreamDrift`.
+3. **Verdicts.** Every candidate gets the verdict of the first layer that applies:
+
+| Layer | Verdict |
+|---|---|
+| no file changes | `neutral:empty` |
+| a revert on the current branch removes a commit with the same patch-id | `expected:reverted-in-current` |
+| only branch-local paths change: `.github/`, `.readiness/`, `branch_local_paths` | `expected:branch-local` |
+| the same stable patch-id is on the current branch above its upstream base | `present:patch-id` |
+| a `cherry picked from commit <sha>` trailer on the current branch names it | `present:cherry-pick-trailer` |
+| its own trailer names a commit the current branch contains | `present:original-in-current` |
+| it and its revert are both candidates | `neutral:revert-pair` |
+| an upstream backport whose ticket key is in the upstream base of the current branch | `present:upstream-ticket-in-base` |
+| only version declarations of build files change, the new values are release versions | `expected:version-bookkeeping` |
+| `git merge-tree --write-tree --merge-base=<sha>^ <current> <sha>` leaves the current tree unchanged | `present:content` |
+| the same for the series of the next candidates that share files with it (up to 10) | `present:content-as-series` |
+| all hunks are in the current files as whole lines; renames are followed, deleted lines must be gone | `present:hunks` |
+| the merge conflicts | `review:diverged`, or `review:diverged-ticket-present` if its key is on the current branch |
+| the merge applies cleanly: the change is missing | `lost`, or `review:ticket-present-content-missing` if its key is on the current branch |
+
+A merge above the upstream base whose `git show --remerge-diff` changes paths outside the branch-local ones gets
+`review:merge-resolution`. Clean merges are skipped: their sides are candidates already.
+
+Ticket keys are words like `ADH-8490`. Upstream key prefixes (`HADOOP`, `FLINK`) are learned from the upstream base
+history and not configured. A commit picked from the same SHA by several predecessors is reported once with all its
+`sources`. A source whose branch moved after the request is still classified at the requested commit and reported
+with `SOURCE_CHANGED`.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant ADRM as ADRM (worker)
+    participant GH as GitHub API
+    participant WF as release-readiness.yml wrapper on the current line branch
+    participant RW as adrm-checks reusable workflow job history
+    participant UP as Upstream repository
+    participant S as lost-commits.mjs
+    ADRM->>GH: discovery: branches and their heads
+    ADRM->>GH: POST …/release-readiness.yml/dispatches, ref = current branch, mode=history, compare_refs
+    GH->>WF: run from the branch head, run-name "history / request_id"
+    WF->>RW: uses …/publication-readiness.yml@sha, inputs plus the static upstream values
+    RW->>RW: checkout with fetch-depth 0
+    RW->>S: upstream: the override or the fork network root from the API
+    RW->>S: classify: candidates, layers of evidence
+    S->>UP: git ls-remote --tags
+    RW->>S: report: envelope with the expected head and wrapper SHA
+    S-->>RW: lost-commits.json
+    RW-->>GH: artifact lost-commits-request_id-attempt
+    ADRM->>GH: download, validate, store findings, apply decisions, count warnings
+```
+
+The report (all candidates with their verdicts; ADRM shows the `present`, `expected` and `neutral` ones only in the
+log of the check):
+
+```json
+{
+  "schemaVersion": 1,
+  "executionMode": "live",
+  "requestId": "<uuid>",
+  "generation": 1,
+  "repository": { "provider": "github", "id": 1, "fullName": "arenadata/flink" },
+  "commit": { "ref": "refs/heads/develop/4.4.0/2.2.1.2", "sha": "<sha>", "state": "resolved" },
+  "checker": { "workflowRef": "arenadata/flink/.github/workflows/release-readiness.yml@refs/heads/develop/4.4.0/2.2.1.2", "workflowSha": "<sha>", "runId": 1, "runAttempt": 1, "runUrl": "https://github.com/arenadata/flink/actions/runs/1" },
+  "checkedAt": "2026-11-05T12:00:00.000Z",
+  "history": {
+    "state": "complete",
+    "upstream": { "repository": "apache/flink", "source": "fork-network-root", "releaseTags": 195 },
+    "current": { "ref": "refs/heads/develop/4.4.0/2.2.1.2", "sha": "<sha>", "upstreamBaseTags": ["release-2.2.1"] },
+    "sources": [
+      { "ref": "refs/heads/develop/4.3.0/2.2.1.1", "sha": "<sha>", "headSha": "<sha>", "state": "resolved", "evaluated": true,
+        "notInCurrent": 1, "aboveUpstreamBase": 1, "upstreamDrift": 0, "candidates": 1, "merges": 0, "mergesWithChanges": 0,
+        "upstreamBaseTags": ["release-2.2.1"] }
+    ],
+    "findings": [
+      { "sha": "<sha>", "patchId": "<stable patch-id>", "kind": "commit", "sources": ["refs/heads/develop/4.3.0/2.2.1.1"],
+        "subject": "ADH-8490: [AQA] Verify pre-auth multipart uploads are rejected (#20)", "author": "…", "authorDate": "2026-09-23",
+        "tickets": ["ADH-8490"], "origin": "ours", "verdict": "lost", "layer": "content",
+        "evidence": { "match": null, "tickets": [], "files": 2, "missingFiles": ["flink-runtime/src/test/java/…/JobManagerWebSpnegoITCase.java"],
+                      "missingFilesTotal": 1, "conflictFiles": [], "hunks": { "present": 1, "total": 16 }, "series": null, "resolutionFiles": [] } }
+    ],
+    "counts": { "findings": 1, "commits": 1, "merges": 0, "lost": 1, "review": 0, "expected": 0, "neutral": 0, "present": 0, "byVerdict": { "lost": 1 } },
+    "durationMs": 3100,
+    "errors": []
+  }
+}
+```
+
+`history.state` can be:
+
+- `complete`;
+- `partial`: findings are reported, but see `errors[]`: `SOURCE_MISSING`, `SOURCE_CHANGED` or `UPSTREAM_BASE_UNTAGGED`
+  (no upstream tag is an ancestor of a predecessor with candidates, so its candidates may include upstream history);
+- `error`: no findings; the codes are `INPUT_INVALID`, `HEAD_CHANGED`, `CHECKER_CHANGED`, `CHECKER_SETUP_ERROR`,
+  `GIT_TOO_OLD` (Git before 2.40), `SHALLOW_HISTORY`, `UPSTREAM_UNAVAILABLE`, `CANDIDATE_LIMIT` (over 3000
+  candidates: the upstream base or the branches are wrong), `CLASSIFY_ERROR` and `REPORT_TOO_LARGE` (over 16 MiB).
+
+`patchId` is the stable patch-id. ADRM keys the "do not port" decisions by it, so they survive a rebase or force-push
+of the old branch. Author e-mails are never reported.
+
+The wrapper's static values for this mode:
+
+- `upstream_repository`: `owner/name` or an https URL; set it only when the root of the fork network is not the real
+  upstream.
+- `branch_local_paths`: extra path prefixes that differ between line branches by design, one per line.
+
 ## Local usage
 
 ```sh
@@ -306,6 +429,13 @@ runs the build tool once per line of `args.txt` and writes `/tmp/adrm-dependenci
 left by a manual `mvn … dependency:tree` run (Gradle: `build/adrm-dependencies.json` left by `adrmDependencies`);
 `report --inventory inventory.json --out dependencies.json --execution-mode fixture` with the environment variables of
 `line` plus `BUILD_TOOL` writes the full `dependencies.json`.
+
+Lost commits by hand, in any full clone (branch names resolve through `refs/remotes/origin/` first, then
+`refs/heads/`):
+`node src/lost-commits.mjs classify --repo <clone> --current develop/4.4.0/2.2.1.2 --sources develop/4.3.0/2.2.1.1,develop/4.3.0/2.0.0.1 --upstream-url https://github.com/apache/flink.git --out history.json`.
+The run writes nothing but merge-tree objects into the clone's object store; use a `git clone --mirror --shared` copy
+to keep even those out of a working clone. `report --history history.json --out lost-commits.json --execution-mode fixture`
+with the environment variables of `line` plus `COMPARE_REFS` writes the full `lost-commits.json`.
 
 `emit --execution-mode fixture` marks the report as local: ADRM will not accept it as live.
 `--simulate <file>:missing,<file>:error` forces the observation of a single file and works only in fixture mode; this is
@@ -333,6 +463,12 @@ for this.
   not covered, Ivy-style publishing is not supported.
 - The inspection reads the version only from the listed build files; a version computed by the build itself (for
   example, from `git describe`) yields `undeclared`, and ADRM goes by the tags.
+- Lost commits are checked by content.
+  - A change moved to another file or rewritten is reported as `lost` or `review`. So is a change undone by hand
+    without a revert commit. People decide in ADRM ("do not port").
+  - Upstream commits a line took after its last base tag stay candidates until an upstream release contains them.
+  - Submodules and LFS pointers are compared as plain changes.
+  - A non-default version template of the repository is not known to the bookkeeping rule.
 - YAML is read only in the subset that the generator writes.
 
 ## Versioning
