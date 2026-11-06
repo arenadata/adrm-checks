@@ -1,24 +1,23 @@
 #!/usr/bin/env node
-// Dependency inventory: the resolved dependency graph of a checkout, taken from the build itself without compiling,
-// normalized into modules / components / edges and wrapped into dependencies.json (ADRM dependency-inventory v1)
-// for mode=dependencies runs.
+// Dependency inventory: the resolved dependency graph of a checkout, read from the build without compiling, as
+// modules, components and edges; dependencies.json (ADRM dependency-inventory v1) for mode=dependencies.
 //
-//   run        runs the build tool once per line of an args file in "only resolve the graph" mode (Maven:
-//              maven-dependency-plugin tree in JSON per module, which collects POMs and downloads no jars; Gradle: the
-//              adrmDependencies task of gradle/adrm-dependencies.init.gradle over incoming.resolutionResult, which
-//              reads metadata and downloads no artifacts), harvests the per-module files after every invocation into
-//              <out>/raw and writes the normalized <out>/inventory.json. The step never fails because of the build:
-//              failures land in inventory.state and inventory.errors.
-//   normalize  normalizes harvested raw files (--raw DIR) or a checkout whose per-module files are still in place
-//              (--from DIR, local use after running the commands by hand) into inventory.json.
-//   report     wraps inventory.json into dependencies.json with the ADRM envelope; inputs from env, as `line`.
+//   run        runs the build tool once per line of an args file (Maven: maven-dependency-plugin tree in JSON per
+//              module, POMs only; Gradle: the adrmDependencies task of gradle/adrm-dependencies.init.gradle, metadata
+//              only), collects the per-module files into <out>/raw after every invocation and writes <out>/inventory.json.
+//              Build failures go into inventory.state and inventory.errors.
+//              --container IMAGE runs every invocation in its own `docker run --rm` with the checkout, <out>/home, the
+//              launcher installation and the adrm files mounted, and with GITHUB_ACTOR, GITHUB_USERNAME and
+//              GITHUB_TOKEN as the only job variables. --maven-settings FILE is passed to Maven as --global-settings.
+//   normalize  inventory.json from collected raw files (--raw DIR) or from a checkout after a manual run (--from DIR).
+//   report     dependencies.json: inventory.json in the ADRM envelope; inputs from the environment, as for `line`.
 //
-// No dependencies; Node >= 20. Exit codes: 0 even when the inventory state is error (ADRM reads the state from the
-// file), 2 for errors of the script itself, 64 for usage.
+// Node >= 20, no dependencies. Exit codes: 0 also when the inventory state is error, 2 for errors of the script, 64 for
+// usage.
 
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
-import { dirname, join, relative, resolve } from 'node:path';
+import { accessSync, constants, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs';
+import { basename, delimiter, dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs, readBranchDispatch, dispatchGate } from './lib/contract.mjs';
 
@@ -33,6 +32,11 @@ const STATES = ['complete', 'partial', 'error', 'unsupported'];
 const SCOPES = new Set(['compile', 'runtime', 'provided', 'test', 'system', 'import']);
 const REPORT_LIMIT = 16 * 1024 * 1024;
 const MAX_ERRORS = 100;
+// Runner file-command and runtime variables, left out of the build environment.
+const RUNNER_CONTROL = /^(GITHUB_(ENV|PATH|OUTPUT|STATE|STEP_SUMMARY)|ACTIONS_.+)$/;
+// Job variables passed into the build container (by name).
+const CONTAINER_ENV = ['GITHUB_ACTOR', 'GITHUB_USERNAME', 'GITHUB_TOKEN'];
+const IMAGE = /^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}$/;
 
 // ---------- helpers ----------
 function emptyCounts() { return { modules: 0, components: 0, edges: 0, invocations: 0, failedInvocations: 0 }; }
@@ -64,11 +68,17 @@ function harvest(tool, from, { remove }) {
       const p = join(dir, entry.name);
       if (entry.name === marker.dir) {
         const file = join(p, marker.file);
-        if (existsSync(file)) {
+        let stat = null;
+        try { stat = lstatSync(file); } catch { /* no file in this module */ }
+        if (stat) {
           const path = relative(root, file);
           const moduleDir = relative(root, dir) || '.';
-          try { files.push({ path, module: tool === 'maven' ? join(moduleDir, 'pom.xml') : moduleDir, data: readJson(file) }); }
-          catch (error) { parseErrors.push({ path, message: error.message }); }
+          // Symbolic links are not followed.
+          if (!stat.isFile()) parseErrors.push({ path, message: 'not a regular file' });
+          else {
+            try { files.push({ path, module: tool === 'maven' ? join(moduleDir, 'pom.xml') : moduleDir, data: readJson(file) }); }
+            catch (error) { parseErrors.push({ path, message: error.message }); }
+          }
           if (remove) { try { unlinkSync(file); } catch { /* best effort: the next invocation overwrites it anyway */ } }
         }
         continue; // build output is never descended into
@@ -100,7 +110,7 @@ function normalizeMavenTree(file, { addModule, addComponent, addEdge }) {
   visit(root, 1, null);
 }
 
-/** Project path -> the coordinates other projects and ADRM know it by: its first Maven publication, else group:name:version. */
+/** Project path -> coordinates: its first Maven publication, else group:name:version. */
 function gradleProjectCoordinates(raws) {
   const coordinates = new Map();
   for (const raw of raws) for (const file of raw.files ?? []) {
@@ -140,7 +150,7 @@ function normalizeGradleDocument(file, coordinates, { addModule, addComponent, a
   }
 }
 
-/** Deterministic normalization of one or more raw harvests (several invocations merge by module coordinates). */
+/** Normalizes one or more raw harvests; invocations merge by module coordinates and the order is deterministic. */
 function normalizeRaw(tool, raws) {
   const modules = new Map(), components = new Map(), edges = new Map();
   const moduleKey = m => `${m.group}:${m.name}:${m.version}`;
@@ -169,10 +179,10 @@ function normalizeRaw(tool, raws) {
     .sort((a, b) => a.module - b.module || cmp(a.configuration ?? '', b.configuration ?? '') || a.component - b.component || cmp(a.scope ?? '', b.scope ?? '') || (a.via ?? -1) - (b.via ?? -1));
 
   const failed = invocations.filter(i => i.exitCode !== 0);
-  if (failed.length) pushError(errors, 'INVOCATION_FAILED', `Инвокации инструмента сборки завершились с ошибкой: ${listOf(failed.map(i => `#${i.index + 1} код ${i.exitCode}: ${i.command}`))}`, true);
-  if (parseErrors.length) pushError(errors, 'TREE_PARSE_ERROR', `Файлы зависимостей не разобраны: ${listOf(parseErrors.map(p => `${p.path}: ${p.message}`))}`);
-  if (incomplete.length) pushError(errors, 'RESOLUTION_INCOMPLETE', `Конфигурации разрешены не полностью: ${listOf(incomplete)}`, true);
-  if (moduleList.length === 0) pushError(errors, 'NO_MODULES', 'Ни один модуль не оставил файла зависимостей: инструмент сборки не запустился или граф не был записан.', true);
+  if (failed.length) pushError(errors, 'INVOCATION_FAILED', `Build tool invocations failed: ${listOf(failed.map(i => `#${i.index + 1} exit ${i.exitCode}: ${i.command}`))}`, true);
+  if (parseErrors.length) pushError(errors, 'TREE_PARSE_ERROR', `Dependency files could not be parsed: ${listOf(parseErrors.map(p => `${p.path}: ${p.message}`))}`);
+  if (incomplete.length) pushError(errors, 'RESOLUTION_INCOMPLETE', `Configurations are not fully resolved: ${listOf(incomplete)}`, true);
+  if (moduleList.length === 0) pushError(errors, 'NO_MODULES', 'No module left a dependency file: the build tool did not run or did not write the graph.', true);
   const state = moduleList.length === 0 ? 'error' : errors.length ? 'partial' : 'complete';
   return {
     state, tool,
@@ -194,27 +204,65 @@ function resolveLauncher(tool, from, command) {
   return { display: chosen, executable };
 }
 
+/** A bare launcher (`mvn`, `gradle`) on the host PATH: its real path and its installation directory. */
+function hostInstallation(command) {
+  for (const dir of (process.env.PATH ?? '').split(delimiter).filter(Boolean)) {
+    const candidate = join(dir, command);
+    try { accessSync(candidate, constants.X_OK); } catch { continue; }
+    const executable = realpathSync(candidate);
+    return { executable, root: basename(dirname(executable)) === 'bin' ? dirname(dirname(executable)) : dirname(executable) };
+  }
+  return null;
+}
+
+/** The environment of a build on the host, without the runner variables. */
+function hostEnv() { return Object.fromEntries(Object.entries(process.env).filter(([name]) => !RUNNER_CONTROL.test(name))); }
+
+/** `docker run --rm` of one invocation: the checkout and the build's home read-write, the other mounts read-only. */
+function containerCommand(image, executable, argv, { from, home, mounts }) {
+  for (const path of [from, home, ...mounts]) if (/[\s:,]/.test(path)) throw new Error(`cannot mount a path with whitespace, ':' or ',' into the build container: ${path}`);
+  const args = ['run', '--rm', '--init', '--user', `${process.getuid()}:${process.getgid()}`, '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--workdir', from,
+    '--env', `HOME=${home}`, '--env', `GRADLE_USER_HOME=${join(home, '.gradle')}`, '--env', `JAVA_TOOL_OPTIONS=-Duser.home=${home}`,
+    ...CONTAINER_ENV.filter(name => process.env[name] !== undefined).flatMap(name => ['--env', name]),
+    '--volume', `${from}:${from}`, '--volume', `${home}:${home}`, ...[...new Set(mounts)].flatMap(path => ['--volume', `${path}:${path}:ro`]),
+    image, executable, ...argv];
+  const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => name === 'PATH' || name === 'HOME' || name.startsWith('DOCKER_') || CONTAINER_ENV.includes(name)));
+  return { file: 'docker', args, env };
+}
+
 function run(opts) {
   const tool = text(opts.tool);
   const from = resolve(opts.from || '.');
   const out = resolve(opts.out || 'adrm-dependencies');
   const inventoryPath = join(out, 'inventory.json');
   const finish = inventory => { writeJson(inventoryPath, inventory); summary(inventoryPath, inventory); };
-  if (tool === 'sbt') return finish(emptyInventory('sbt', 'unsupported', [{ code: 'TOOL_UNSUPPORTED', message: 'Инструмент сборки sbt не поддерживается инвентаризацией зависимостей.', retryable: false }]));
-  if (!['maven', 'gradle'].includes(tool)) return finish(emptyInventory(null, 'error', [{ code: 'INPUT_INVALID', message: `Неизвестный инструмент сборки: ${tool || '(пусто)'}; ожидается maven, gradle или sbt.`, retryable: false }]));
+  if (tool === 'sbt') return finish(emptyInventory('sbt', 'unsupported', [{ code: 'TOOL_UNSUPPORTED', message: 'The dependency inventory does not support sbt.', retryable: false }]));
+  if (!['maven', 'gradle'].includes(tool)) return finish(emptyInventory(null, 'error', [{ code: 'INPUT_INVALID', message: `Unknown build tool: ${tool || '(empty)'}; expected maven, gradle or sbt.`, retryable: false }]));
+  const image = opts.container ? text(opts.container) : null;
+  if (image !== null && !IMAGE.test(image)) throw new Error(`--container must be an image reference: ${image.slice(0, 100)}`);
+  const settings = tool === 'maven' && opts['maven-settings'] ? resolve(text(opts['maven-settings'])) : null;
+  if (settings && !existsSync(settings)) throw new Error(`Maven settings not found: ${settings}`);
   const launcher = resolveLauncher(tool, from, opts.command);
+  // A bare launcher comes from the host installation; the image provides the JDK.
+  const installation = image && !launcher.display.includes('/') ? hostInstallation(launcher.display) : null;
+  const home = join(out, 'home');
+  if (image) { mkdirSync(home, { recursive: true }); console.log(`adrm dependencies: every invocation runs in a throwaway ${image} container`); }
+  const mounts = [installation?.root, tool === 'gradle' ? dirname(GRADLE_INIT_SCRIPT) : null, settings].filter(Boolean);
   const lines = opts['args-file'] ? readFileSync(opts['args-file'], 'utf8').split(/\r?\n/).map(l => l.trim()).filter(l => l && !l.startsWith('#')) : [];
   const rawDir = join(out, 'raw');
   mkdirSync(rawDir, { recursive: true });
   const raws = (lines.length ? lines : ['']).map((line, index) => {
     const extra = line ? line.split(/\s+/) : [];
     const argv = tool === 'maven'
-      ? ['-B', '-ntp', '-fae', '-T', '1C', '-Dscan=false', ...extra, MAVEN_TREE_GOAL, '-DoutputType=json', `-DoutputFile=target/${MAVEN_TREE_FILE}`, '-DoutputEncoding=UTF-8']
-      : ['--init-script', GRADLE_INIT_SCRIPT, '--no-configuration-cache', '--continue', ...extra, GRADLE_TASK];
+      ? ['-B', '-ntp', '-fae', '-T', '1C', '-Dscan=false', ...(settings ? ['--global-settings', settings] : []), ...extra, MAVEN_TREE_GOAL, '-DoutputType=json', `-DoutputFile=target/${MAVEN_TREE_FILE}`, '-DoutputEncoding=UTF-8']
+      : ['--init-script', GRADLE_INIT_SCRIPT, '--no-daemon', '--no-configuration-cache', '--continue', ...extra, GRADLE_TASK];
     const command = [launcher.display, ...argv].join(' ');
     console.log(`::group::adrm dependencies: invocation ${index + 1}: ${command}`);
     const started = Date.now();
-    const result = spawnSync(launcher.executable, argv, { cwd: from, stdio: ['ignore', 'inherit', 'inherit'] });
+    const spawn = image
+      ? containerCommand(image, installation?.executable ?? launcher.executable, argv, { from, home, mounts })
+      : { file: launcher.executable, args: argv, env: hostEnv() };
+    const result = spawnSync(spawn.file, spawn.args, { cwd: from, stdio: ['ignore', 'inherit', 'inherit'], env: spawn.env });
     const durationMs = Date.now() - started;
     if (result.error) console.error(`adrm dependencies: ${result.error.message}`);
     console.log('::endgroup::');
@@ -246,7 +294,7 @@ function normalize(opts) {
 }
 
 // ---------- report: the ADRM envelope (dependencies.json, dependency-inventory v1) ----------
-// Inputs come from the dispatching workflow, as for `line`: REQUEST_ID, GENERATION, GITHUB_REPOSITORY,
+// Inputs from the environment, as for `line`, plus BUILD_TOOL: REQUEST_ID, GENERATION, GITHUB_REPOSITORY,
 // GITHUB_REPOSITORY_ID, GITHUB_REF_NAME, GITHUB_SHA, EXPECTED_HEAD_SHA, GITHUB_WORKFLOW_REF, GITHUB_WORKFLOW_SHA,
 // EXPECTED_CHECKER_SHA, GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT, CHECKER_SETUP_STATUS, BUILD_TOOL, RESULT_PATH.
 function report(opts) {
@@ -265,15 +313,15 @@ function report(opts) {
     checkedAt: new Date().toISOString(),
     inventory: emptyInventory(tool, 'error', []),
   };
-  const gate = dispatchGate(d, env, { skipped: 'граф зависимостей не строился', setupSkipped: 'инструмент сборки не запускался' });
+  const gate = dispatchGate(d, env, { skipped: 'the dependency graph was not built', setupSkipped: 'the build tool did not run' });
   if (gate) result.inventory.errors.push(gate);
   else {
     let inventory = null;
     try { inventory = readJson(inventoryPath); }
-    catch (error) { pushError(result.inventory.errors, 'CHECKER_SETUP_ERROR', `Инвентаризация не выполнена: ${inventoryPath} отсутствует или не читается (${error.message}).`, true); }
+    catch (error) { pushError(result.inventory.errors, 'CHECKER_SETUP_ERROR', `The inventory did not run: ${inventoryPath} is missing or unreadable (${error.message}).`, true); }
     if (inventory) {
       const wellFormed = typeof inventory === 'object' && STATES.includes(inventory.state) && ['invocations', 'modules', 'components', 'edges', 'errors'].every(k => Array.isArray(inventory[k])) && inventory.counts && typeof inventory.counts === 'object';
-      if (!wellFormed) pushError(result.inventory.errors, 'CHECKER_SETUP_ERROR', `Файл ${inventoryPath} не является результатом инвентаризации.`, true);
+      if (!wellFormed) pushError(result.inventory.errors, 'CHECKER_SETUP_ERROR', `${inventoryPath} is not an inventory.`, true);
       else result.inventory = { ...inventory, tool: inventory.tool ?? tool };
     }
   }
@@ -282,14 +330,14 @@ function report(opts) {
   if (Buffer.byteLength(body, 'utf8') > REPORT_LIMIT) {
     const counts = result.inventory.counts;
     result.inventory = { ...result.inventory, state: 'error', modules: [], components: [], edges: [], counts: { ...emptyCounts(), invocations: counts.invocations, failedInvocations: counts.failedInvocations }, errors: [...result.inventory.errors] };
-    pushError(result.inventory.errors, 'REPORT_TOO_LARGE', `Отчёт превышает 16 МиБ; граф зависимостей не передан (модулей ${counts.modules}, компонентов ${counts.components}, рёбер ${counts.edges}).`);
+    pushError(result.inventory.errors, 'REPORT_TOO_LARGE', `The report exceeds 16 MiB; the dependency graph is left out (${counts.modules} modules, ${counts.components} components, ${counts.edges} edges).`);
     body = JSON.stringify(result);
   }
   writeFileSync(resultPath, body);
   console.error(`dependencies.json written to ${resultPath}: ${JSON.stringify({ commit: result.commit.state, state: result.inventory.state, tool: result.inventory.tool, ...result.inventory.counts, errors: result.inventory.errors.map(e => e.code) })}`);
 }
 
-const usage = 'Usage: dependency-inventory.mjs run --tool maven|gradle|sbt [--command mvn|./mvnw|./build/mvn|./gradlew] [--args-file FILE] [--from DIR] [--out DIR]\n' +
+const usage = 'Usage: dependency-inventory.mjs run --tool maven|gradle|sbt [--command mvn|./mvnw|./build/mvn|./gradlew] [--args-file FILE] [--from DIR] [--out DIR] [--container IMAGE] [--maven-settings FILE]\n' +
   '       dependency-inventory.mjs normalize --tool maven|gradle (--raw DIR | --from DIR) [--out inventory.json]\n' +
   '       dependency-inventory.mjs report --inventory inventory.json [--out dependencies.json] [--execution-mode live|fixture]   (ADRM dependencies.json v1 for mode=dependencies; inputs from env)';
 let parsed;

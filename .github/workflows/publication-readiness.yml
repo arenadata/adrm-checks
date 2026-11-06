@@ -1,16 +1,12 @@
-# Reusable workflow called by a project's thin wrapper (see examples/release-readiness.yml).
-# Runs in the caller's context: its GITHUB_TOKEN (packages: read), its repository, its workflow SHA.
-# mode=check (default): reads .readiness/publication.yaml from the caller repository at the caller's workflow
-#   revision, runs `emit` from this repository at the called-workflow revision, uploads result.json for ADRM.
-# mode=inspect: ADRM dispatched the wrapper on a line branch; runs `line` on that branch head and uploads
-#   line.json (the declared project version) for ADRM. Nothing is built in either mode.
-# mode=dependencies: ADRM dispatched the wrapper on a line branch; resolves the dependency graph of the branch head
-#   from the build itself (Maven dependency:tree in JSON per module, Gradle init-script task over the resolution
-#   result; nothing is compiled or published) with the project's static build_* values from the wrapper, and uploads
-#   dependencies.json for ADRM.
-# mode=history: ADRM dispatched the wrapper on the current line branch with the predecessor branches in compare_refs;
-#   classifies the commits of the predecessors that the branch head lacks (full clone, upstream release tags as the
-#   boundary, layered evidence; nothing is built or written to refs) and uploads lost-commits.json for ADRM.
+# Reusable workflow called by a project's wrapper (examples/release-readiness.yml); runs with the caller's
+# GITHUB_TOKEN, repository and workflow SHA.
+# mode=check (default): `emit` against .readiness/publication.yaml at the caller's workflow revision; result.json.
+# mode=inspect: `line` on the head of the dispatched line branch; line.json with the declared project version.
+# mode=dependencies: the dependency graph of the branch head from the build (Maven dependency:tree in JSON per
+#   module, a Gradle init-script task over the resolution result; nothing is compiled or published), one container
+#   per invocation, with the build_* values of the wrapper; dependencies.json.
+# mode=history: the commits of the predecessor branches in compare_refs that the branch head lacks (full clone,
+#   upstream release tags as the boundary; nothing is built or written to refs); lost-commits.json.
 name: Publication readiness (reusable)
 
 on:
@@ -32,9 +28,10 @@ on:
       build_tool: { type: string, required: false, default: '' }             # maven | gradle | sbt
       build_command: { type: string, required: false, default: '' }          # mvn | ./mvnw | ./build/mvn | ./gradlew
       build_args: { type: string, required: false, default: '' }             # one invocation per line: flags and profiles only
-      java_version: { type: string, required: false, default: '' }
-      java_distribution: { type: string, required: false, default: temurin }
-      maven_server_ids: { type: string, required: false, default: arenadata } # server ids the build resolves from, comma-separated
+      java_version: { type: string, required: false, default: '' }           # major version: the eclipse-temurin:<java_version>-jdk image
+      java_distribution: { type: string, required: false, default: temurin } # temurin only
+      maven_server_ids: { type: string, required: false, default: arenadata } # ids resolved from GitHub Packages of the owner, comma-separated
+      maven_mirrors: { type: string, required: false, default: '' }          # `<id> <https url>` per line: ids pinned to another registry, no credentials
       # mode=history: predecessor branches from ADRM, one `<branch>@<sha>` per line; static values of the project
       compare_refs: { type: string, required: false, default: '' }
       upstream_repository: { type: string, required: false, default: '' }  # owner/name; default: root of the fork network
@@ -169,40 +166,59 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ inputs.node-version }}
-      # No Maven cache: a fresh ~/.m2 keeps mavenLocal() (first in Iceberg's repositories) empty, so the graph is what
-      # the registries serve.
-      - name: Set up Java
+      # Every invocation runs in a container of this image with the checkout, the build's home and the launcher
+      # mounted (see the dependencies action). The JDK comes from the image; the home starts empty, so mavenLocal()
+      # (first in Iceberg's repositories) cannot shadow the registries.
+      - name: Choose the build container
+        id: container
         if: inputs.build_tool == 'maven' || inputs.build_tool == 'gradle'
-        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
-        with:
-          distribution: ${{ inputs.java_distribution }}
-          java-version: ${{ inputs.java_version }}
-      - name: Set up Gradle
-        if: inputs.build_tool == 'gradle'
-        uses: gradle/actions/setup-gradle@af1da67850ed9a4cedd57bfd976089dd991e2582
-        with:
-          cache-read-only: true
-          add-job-summary: on-failure
-      # setup-java always writes ~/.m2/settings.xml (server id github); the build resolves from the registries whose
-      # server ids are listed here, all with the workflow token (GitHub Packages requires a token even to read).
+        env:
+          JAVA_VERSION: ${{ inputs.java_version }}
+          JAVA_DISTRIBUTION: ${{ inputs.java_distribution }}
+        run: |
+          set -euo pipefail
+          [ "$JAVA_DISTRIBUTION" = temurin ] || { echo "::error::java_distribution must be temurin (the build runs in eclipse-temurin images): $JAVA_DISTRIBUTION"; exit 1; }
+          [[ "$JAVA_VERSION" =~ ^[0-9]{1,3}$ ]] || { echo "::error::java_version must be a major version such as 8, 17 or 21: $JAVA_VERSION"; exit 1; }
+          echo "image=eclipse-temurin:${JAVA_VERSION}-jdk" >> "$GITHUB_OUTPUT"
+      # Every id of maven_server_ids gets the workflow token (GitHub Packages requires one even to read) and a mirror
+      # of the same id to GitHub Packages of the repository owner, which covers every repository with that id in the
+      # graph. maven_mirrors pins further ids to another registry, without credentials (for an id that names two hosts
+      # across the modules). The file is passed to Maven as --global-settings, so it also works with a project's own
+      # --settings in build_args.
       - name: Configure Maven servers
         if: inputs.build_tool == 'maven'
         env:
           SERVER_IDS: ${{ inputs.maven_server_ids }}
+          MIRRORS: ${{ inputs.maven_mirrors }}
+          OWNER: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
-          mkdir -p ~/.m2
-          {
-            echo '<settings><servers>'
-            IFS=, read -ra ids <<< "$SERVER_IDS"
-            for id in "${ids[@]}"; do
-              id="${id// /}"
-              [ -z "$id" ] && continue
-              [[ "$id" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::invalid Maven server id: $id"; exit 1; }
-              printf '<server><id>%s</id><username>${env.GITHUB_ACTOR}</username><password>${env.GITHUB_TOKEN}</password></server>\n' "$id"
-            done
-            echo '</servers></settings>'
-          } > ~/.m2/settings.xml
+          [[ "$OWNER" =~ ^[A-Za-z0-9-]+$ ]] || { echo "::error::invalid repository owner: $OWNER"; exit 1; }
+          servers='' mirrors='' pinned=''
+          IFS=, read -ra ids <<< "$SERVER_IDS"
+          for id in "${ids[@]}"; do
+            id="${id// /}"
+            [ -z "$id" ] && continue
+            [[ "$id" =~ ^[A-Za-z0-9._-]+$ && "$id" != central ]] || { echo "::error::invalid Maven server id: $id"; exit 1; }
+            servers+=$(printf '<server><id>%s</id><username>${env.GITHUB_ACTOR}</username><password>${env.GITHUB_TOKEN}</password></server>' "$id")
+            mirrors+=$(printf '<mirror><id>%s</id><mirrorOf>%s</mirrorOf><url>https://maven.pkg.github.com/%s/*</url></mirror>' "$id" "$id" "$OWNER")
+            pinned+="$id "
+          done
+          echo "Server ids with the workflow token, pinned to https://maven.pkg.github.com/$OWNER/*: ${pinned:-none}"
+          anonymous=''
+          while read -r id url rest; do
+            [ -z "${id:-}" ] && continue
+            [[ "$id" =~ ^[A-Za-z0-9._-]+$ && "$id" != central && -z "${rest:-}" ]] || { echo "::error::invalid maven_mirrors line: $id $url $rest"; exit 1; }
+            [[ "${url:-}" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~*/-]*)?$ ]] || { echo "::error::invalid maven_mirrors URL for $id: ${url:-}"; exit 1; }
+            [[ " $pinned$anonymous " != *" $id "* ]] || { echo "::error::Maven id $id is listed twice in maven_server_ids and maven_mirrors"; exit 1; }
+            mirrors+=$(printf '<mirror><id>%s</id><mirrorOf>%s</mirrorOf><url>%s</url></mirror>' "$id" "$id" "$url")
+            anonymous+="$id "
+            echo "Id $id pinned to $url, without the token"
+          done <<< "$MIRRORS"
+          # Maven's own default, lost when the global settings are replaced: no repositories over plain HTTP.
+          mirrors+='<mirror><id>maven-default-http-blocker</id><mirrorOf>external:http:*</mirrorOf><url>http://0.0.0.0/</url><blocked>true</blocked></mirror>'
+          mkdir -p "$RUNNER_TEMP/adrm-maven"
+          printf '<settings><servers>%s</servers><mirrors>%s</mirrors></settings>\n' "$servers" "$mirrors" > "$RUNNER_TEMP/adrm-maven/settings.xml"
       # A stale dispatch (the head or the wrapper moved) is reported by `report` as HEAD_CHANGED / CHECKER_CHANGED
       # without running the build.
       - name: Resolve the dependency graph from the build
@@ -219,6 +235,8 @@ jobs:
           args: ${{ inputs.build_args }}
           from: project
           out: ${{ runner.temp }}/adrm-dependencies
+          container: ${{ steps.container.outputs.image }}
+          maven-settings: ${{ inputs.build_tool == 'maven' && format('{0}/adrm-maven/settings.xml', runner.temp) || '' }}
       - name: Report the dependency inventory
         if: always()
         env:

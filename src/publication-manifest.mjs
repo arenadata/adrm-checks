@@ -1,21 +1,19 @@
 #!/usr/bin/env node
-// Publication manifest: a version-independent, reviewable list of the files a project publishes.
+// Publication manifest: the files a project publishes, per module, without versions.
 //
-//   generate  builds .readiness/publication.yaml. Primary source (--from-sandbox DIR): the directory into which
-//             the project's own publisher wrote when its publish command was run with the destination redirected
-//             to a local file repository (Maven: -DaltDeploymentRepository=id::file://DIR via MAVEN_OPTS;
-//             Gradle: init script that points PublishToMavenRepository tasks at file://DIR). That is the
-//             publication computed from sources + workflow, with nothing read from the registry.
-//             Alternative source (--from-coordinates FILE): coordinates produced by an introspection tool.
-//   verify    expands the manifest for a given version and checks every file in the registry (HEAD).
-//   line      declared project version of a branch checkout -> line.json (ADRM line-state v1) for mode=inspect runs.
+//   generate  writes .readiness/publication.yaml from the file repository the project's publisher wrote to with its
+//             destination redirected (--from-sandbox DIR; Maven: -DaltDeploymentRepository=id::file://DIR in
+//             MAVEN_OPTS, Gradle and sbt: the adrm sandbox scripts), or from a coordinate list (--from-coordinates).
+//   verify    HEAD of every file of the manifest for one version.
+//   emit      result.json (ADRM contract v1) for mode=check.
+//   line      the declared version of a branch checkout: line.json (ADRM line-state v1) for mode=inspect.
 //
-// Only GET/HEAD requests are made: the standard Maven repository layout for files, the GitHub API for the
-// source repository and tag. Env: PACKAGE_TOKEN (registry, read:packages) and GITHUB_TOKEN (API). No dependencies; Node >= 20.
+// Only GET and HEAD requests. Env: PACKAGE_TOKEN for the registry (read:packages, falls back to GITHUB_TOKEN) and
+// GITHUB_TOKEN for the API. The registry is GitHub Packages of the repository owner; verify also reads other
+// registries, without a token. Node >= 20, no dependencies.
 //
-// Manifest file entries are literal file-name suffixes after "<artifactId>-<version>":
-//   .pom .jar -sources.jar -tests.jar -cyclonedx.json .module -bin.tar.gz .jar.asc
-// so the URL of a file is always <registry>/<group path>/<artifactId>/<version>/<artifactId>-<version><suffix>.
+// Manifest entries are file-name suffixes after "<artifactId>-<version>" (.pom .jar -sources.jar -tests.jar
+// -cyclonedx.json .module -bin.tar.gz .jar.asc): <registry>/<group path>/<artifactId>/<version>/<artifactId>-<version><suffix>.
 
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync } from 'node:fs';
 import { dirname, join, relative, sep } from 'node:path';
@@ -24,6 +22,13 @@ import { parseArgs, SHA, UUID, readBranchDispatch, dispatchGate } from './lib/co
 
 const CHECKSUM_SUFFIXES = ['.md5', '.sha1', '.sha256', '.sha512'];
 const API = 'https://api.github.com';
+// GitHub Packages (Maven): https://maven.pkg.github.com/<owner>/<name>.
+const GITHUB_PACKAGES = 'https://maven.pkg.github.com';
+const GITHUB_PACKAGES_REGISTRY = /^https:\/\/maven\.pkg\.github\.com\/([A-Za-z0-9][A-Za-z0-9-]{0,38})\/([A-Za-z0-9_.-]{1,100})$/;
+// Group ids, artifact ids and file-name suffixes of a manifest.
+const GROUP_ID = /^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)*$/;
+const ARTIFACT_ID = /^[A-Za-z0-9_][A-Za-z0-9_.-]*$/;
+const FILE_SUFFIX = /^[-.][A-Za-z0-9_.-]+$/;
 
 function token() {
   const t = process.env.PACKAGE_TOKEN || process.env.GITHUB_TOKEN;
@@ -38,6 +43,22 @@ async function api(path, init = {}) {
   const res = await fetch(`${API}${path}`, { ...init, headers: { Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28', Authorization: `Bearer ${apiToken()}`, ...(init.headers || {}) } });
   if (!res.ok) { const e = new Error(`GitHub API ${path}: HTTP ${res.status}`); e.status = res.status; throw e; }
   return res.json();
+}
+
+/** The registry as a URL when it is GitHub Packages of the repository owner, else null. */
+function githubPackagesRegistry(value, repository) {
+  const m = GITHUB_PACKAGES_REGISTRY.exec(typeof value === 'string' ? value : '');
+  const owner = String(repository ?? '').split('/')[0].toLowerCase();
+  if (!m || !owner || m[1].toLowerCase() !== owner || m[2] === '.' || m[2] === '..') return null;
+  return new URL(m[0]);
+}
+function isGithubPackages(url) { try { return new URL(url).origin === GITHUB_PACKAGES; } catch { return false; } }
+
+/** The registry a generated manifest records: --registry, else GitHub Packages of --registry-repo or --repo. */
+function manifestRegistry(opts, repo) {
+  const registry = opts.registry || `${GITHUB_PACKAGES}/${opts['registry-repo'] || repo}`;
+  if (!githubPackagesRegistry(registry, repo)) throw new Error(`registry ${registry} is not GitHub Packages of the ${String(repo).split('/')[0]} account (${GITHUB_PACKAGES}/<owner>/<name>); emit checks no other registry`);
+  return registry;
 }
 
 function classify(fileName, artifactId, version) {
@@ -152,7 +173,7 @@ function readSandbox(dir, opts) {
 async function generateFromSandbox(opts) {
   const dir = opts['from-sandbox'];
   const repo = opts.repo; if (!repo) throw new Error('--repo owner/name is required');
-  const registry = opts.registry || `https://maven.pkg.github.com/${opts['registry-repo'] || repo}`;
+  const registry = manifestRegistry(opts, repo);
   const out = opts.out || '.readiness/publication.yaml';
   const sandbox = readSandbox(dir, opts);
   const modules = Object.values(sandbox.groups).reduce((n, g) => n + Object.keys(g).length, 0);
@@ -181,7 +202,7 @@ async function generateFromSandbox(opts) {
   writeManifest(out, manifest, sandbox.warnings, opts);
 }
 
-/** Canonical order: groups and modules sorted, suffixes sorted; the digest must not depend on the generation method. */
+/** Groups, modules and suffixes in sorted order: the digest does not depend on how the manifest was generated. */
 function canonicalGroups(groups) {
   const out = {};
   for (const g of Object.keys(groups).sort()) { out[g] = {}; for (const m of Object.keys(groups[g]).sort()) out[g][m] = [...new Set(groups[g][m])].sort(); }
@@ -216,7 +237,7 @@ function writeManifest(out, manifest, warnings, opts) {
 async function generateFromCoordinates(opts) {
   const file = opts['from-coordinates'];
   const repo = opts.repo; if (!repo) throw new Error('--repo owner/name is required');
-  const registry = opts.registry || `https://maven.pkg.github.com/${opts['registry-repo'] || repo}`;
+  const registry = manifestRegistry(opts, repo);
   const out = opts.out || '.readiness/publication.yaml';
   const raw = JSON.parse(readFileSync(file, 'utf8'));
   const list = Array.isArray(raw) ? raw : raw.files;
@@ -261,11 +282,17 @@ function diffGroups(a, b) {
 }
 
 // ---------- verify ----------
+/** Registry URLs of every file of the manifest for one version; throws on an invalid version or name. */
 function expand(manifest, version) {
+  const plain = (pattern, value) => typeof value === 'string' && value.length <= 256 && pattern.test(value);
+  if (!plain(SAFE_VERSION, version)) throw new Error(`version ${String(version).slice(0, 100)} is not a plain Maven version`);
   const files = [];
   for (const [groupId, modules] of Object.entries(manifest.groups)) {
+    if (!plain(GROUP_ID, groupId) || !modules || typeof modules !== 'object' || Array.isArray(modules)) throw new Error(`group ${groupId.slice(0, 100)} is not a plain Maven group`);
     for (const [artifactId, suffixes] of Object.entries(modules)) {
+      if (!plain(ARTIFACT_ID, artifactId) || !Array.isArray(suffixes)) throw new Error(`module ${groupId}:${artifactId.slice(0, 100)} is not a plain Maven module`);
       for (const suffix of suffixes) {
+        if (!plain(FILE_SUFFIX, suffix)) throw new Error(`file suffix ${String(suffix).slice(0, 100)} of ${groupId}:${artifactId} is not a plain file-name suffix`);
         const fileName = `${artifactId}-${version}${suffix}`;
         files.push({ groupId, artifactId, suffix, ...suffixToParts(suffix), fileName, url: `${manifest.registry}/${groupId.replace(/\./g, '/')}/${artifactId}/${version}/${fileName}` });
       }
@@ -274,10 +301,13 @@ function expand(manifest, version) {
   return files;
 }
 
+/** HEAD of one registry file; the token is added for GitHub Packages only. */
 async function head(url) {
+  const github = isGithubPackages(url);
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      const res = await fetch(url, { method: 'HEAD', headers: { Authorization: `Bearer ${token()}` }, redirect: 'manual', signal: AbortSignal.timeout(30000) });
+      const headers = github ? { Authorization: `Bearer ${token()}` } : {};
+      const res = await fetch(url, { method: 'HEAD', headers, redirect: 'manual', signal: AbortSignal.timeout(30000) });
       if (res.status >= 500 || res.status === 429) { await new Promise(r => setTimeout(r, 1500 * (attempt + 1))); continue; }
       return { http: res.status, state: res.status === 200 ? 'present' : res.status === 404 ? 'missing' : 'error' };
     } catch (e) { if (attempt === 2) return { http: null, state: 'error', error: e.name }; }
@@ -291,6 +321,7 @@ async function verify(opts) {
   const manifest = fromYaml(readFileSync(manifestPath, 'utf8'));
   if (manifest.schema !== 'adrm/publication-manifest/v1') throw new Error(`Unsupported manifest schema: ${manifest.schema}`);
   const expected = expand(manifest, version);
+  if (!expected.every(f => isGithubPackages(f.url))) console.error(`registry ${manifest.registry} is not GitHub Packages: its files are asked without a token`);
   const concurrency = Number(opts.concurrency || 6);
   const observations = new Array(expected.length);
   let next = 0; const started = Date.now();
@@ -322,12 +353,11 @@ async function observeManifest(manifest, version, concurrency, simulate = new Ma
 }
 
 // ---------- emit: ADRM result.json, contract v1 ----------
-// Inputs come from the dispatching workflow (same names as the previous checker): REQUEST_ID, GENERATION,
-// GITHUB_REPOSITORY, GITHUB_REPOSITORY_ID, TARGET_TAG, TARGET_SHA, TARGET_VERSION, PRODUCT_VERSION,
-// GITHUB_WORKFLOW_REF, GITHUB_WORKFLOW_SHA, EXPECTED_CHECKER_SHA, GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT,
-// CHECKER_SETUP_STATUS, RESULT_PATH; GITHUB_TOKEN for the API, PACKAGE_TOKEN for the registry.
-// The report never claims readiness itself: ADRM recomputes it from target state, inventory and observations.
-// Tag, project and product versions are shaped by ADRM templates (configurable per repository); only path-safe characters matter here.
+// Inputs from the environment: REQUEST_ID, GENERATION, GITHUB_REPOSITORY, GITHUB_REPOSITORY_ID, TARGET_TAG, TARGET_SHA,
+// TARGET_VERSION, PRODUCT_VERSION, GITHUB_WORKFLOW_REF, GITHUB_WORKFLOW_SHA, EXPECTED_CHECKER_SHA, GITHUB_RUN_ID,
+// GITHUB_RUN_ATTEMPT, CHECKER_SETUP_STATUS, RESULT_PATH; GITHUB_TOKEN for the API, PACKAGE_TOKEN for the registry.
+// ADRM computes readiness itself from the target state, the inventory and the observations.
+// Versions follow the ADRM templates; here they only have to fit into a registry path.
 const SAFE_VERSION = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,255}$/;
 
 /** Same canonical digest as ADRM src/domain/manifest.ts: sorted requirement tuples, sha256 of their JSON. */
@@ -346,8 +376,7 @@ async function emit(opts) {
   const concurrency = Number(opts.concurrency || 6);
   const executionMode = opts['execution-mode'] || 'live';
   if (!['live', 'fixture'].includes(executionMode)) throw new Error('--execution-mode must be live or fixture');
-  // --simulate "<fileName>:missing,<fileName>:error" forces observations for local fixtures; never allowed in live mode,
-  // so a report with simulated observations can never pass ADRM's live ingestion (executionMode mismatch).
+  // --simulate "<fileName>:missing,<fileName>:error" forces observations; fixture mode only.
   const simulate = new Map();
   for (const item of String(opts.simulate || '').split(',').map(x => x.trim()).filter(Boolean)) {
     const at = item.lastIndexOf(':'); const file = item.slice(0, at), state = item.slice(at + 1);
@@ -385,47 +414,48 @@ async function emit(opts) {
   const finish = () => {
     result.checkedAt = new Date().toISOString();
     const text = JSON.stringify(result, null, 1);
-    if (Buffer.byteLength(text, 'utf8') > 1024 * 1024) { result.publication.artifacts = []; result.publication.inventory = null; result.publication.requirementsComplete = false; diagnostic('REPORT_TOO_LARGE', 'Отчёт превышает 1 МиБ; список файлов не передан.'); }
+    if (Buffer.byteLength(text, 'utf8') > 1024 * 1024) { result.publication.artifacts = []; result.publication.inventory = null; result.publication.requirementsComplete = false; diagnostic('REPORT_TOO_LARGE', 'The report exceeds 1 MiB; the file list is left out.'); }
     writeFileSync(resultPath, JSON.stringify(result, null, 1));
     const summary = { outcome: result.check.outcome, target: result.target.state, requirementsComplete: result.publication.requirementsComplete, artifacts: result.publication.artifacts.length, present: result.publication.artifacts.filter(a => a.state === 'present').length, missing: result.publication.artifacts.filter(a => a.state === 'missing').length, unknown: result.publication.artifacts.filter(a => a.state === 'unknown').length, errors: result.check.errors.map(e => e.code), publicationReady: result.publicationReady, dependencies: `${result.dependencies.outcome} ${result.dependencies.observations.length} observed, ${result.dependencies.errors.length} errors` };
     console.error(`result.json written to ${resultPath}: ${JSON.stringify(summary)}`);
   };
-  if (invalid.length) { diagnostic('INPUT_INVALID', `Некорректные входные данные workflow: ${invalid.join(', ')}.`); finish(); return; }
+  if (invalid.length) { diagnostic('INPUT_INVALID', `Invalid workflow inputs: ${invalid.join(', ')}.`); finish(); return; }
 
   try {
-    if (inputs.checker.workflowSha !== inputs.checker.expectedSha) throw new CheckError('CHECKER_CHANGED', 'Версия проверяющего workflow отличается от ожидаемой ADRM.');
-    if (env.CHECKER_SETUP_STATUS && env.CHECKER_SETUP_STATUS !== 'success') throw new CheckError('CHECKER_SETUP_ERROR', 'Подготовительный шаг workflow завершился с ошибкой; registry не опрашивался.', true);
-    // The tag, version and product version come from ADRM, which derives them from its own branch/version/tag
-    // templates (configurable per repository); their format is not re-checked here.
+    if (inputs.checker.workflowSha !== inputs.checker.expectedSha) throw new CheckError('CHECKER_CHANGED', 'The checker workflow revision differs from the one ADRM expects.');
+    if (env.CHECKER_SETUP_STATUS && env.CHECKER_SETUP_STATUS !== 'success') throw new CheckError('CHECKER_SETUP_ERROR', 'A setup step of the workflow failed; the registry was not queried.', true);
+    // The tag and the versions come from the ADRM templates and are used as given.
     let manifest;
-    try { manifest = fromYaml(readFileSync(manifestPath, 'utf8')); } catch { throw new CheckError('CHECK_NOT_CONFIGURED', `Manifest публикации не прочитан: ${manifestPath}.`); }
-    if (manifest.schema !== 'adrm/publication-manifest/v1' || !manifest.groups || !manifest.registry) throw new CheckError('CHECK_NOT_CONFIGURED', 'Manifest публикации имеет неподдерживаемую схему.');
-    if (String(manifest.project).toLowerCase() !== inputs.repository.toLowerCase()) throw new CheckError('CHECK_NOT_CONFIGURED', 'Manifest публикации относится к другому репозиторию.');
-    const registry = new URL(manifest.registry);
-    if (registry.protocol !== 'https:' || registry.username || registry.password) throw new CheckError('CHECK_NOT_CONFIGURED', 'Адрес registry в manifest недопустим.');
+    try { manifest = fromYaml(readFileSync(manifestPath, 'utf8')); } catch { throw new CheckError('CHECK_NOT_CONFIGURED', `The publication manifest could not be read: ${manifestPath}.`); }
+    if (manifest.schema !== 'adrm/publication-manifest/v1' || !manifest.groups || !manifest.registry) throw new CheckError('CHECK_NOT_CONFIGURED', 'The publication manifest has an unsupported schema.');
+    if (String(manifest.project).toLowerCase() !== inputs.repository.toLowerCase()) throw new CheckError('CHECK_NOT_CONFIGURED', 'The publication manifest belongs to another repository.');
+    const registry = githubPackagesRegistry(manifest.registry, inputs.repository);
+    if (!registry) throw new CheckError('CHECK_NOT_CONFIGURED', 'Unsupported registry in the manifest: only GitHub Packages of the repository owner are checked (https://maven.pkg.github.com/<owner>/<name>).');
     const repositoryIdName = manifest.repositoryId || registry.pathname.split('/').filter(Boolean).at(-1) || 'registry';
+    let expected;
+    try { expected = expand(manifest, inputs.target.fullVersion); }
+    catch (error) { throw new CheckError('CHECK_NOT_CONFIGURED', `The publication manifest contains invalid names: ${error.message}.`); }
 
     const metadata = await api(`/repos/${inputs.repository}`);
-    if (metadata?.id !== inputs.repositoryId || String(metadata?.full_name).toLowerCase() !== inputs.repository.toLowerCase()) throw new CheckError('REPOSITORY_IDENTITY_MISMATCH', 'Идентичность репозитория-источника не подтверждена.');
+    if (metadata?.id !== inputs.repositoryId || String(metadata?.full_name).toLowerCase() !== inputs.repository.toLowerCase()) throw new CheckError('REPOSITORY_IDENTITY_MISMATCH', 'The identity of the source repository is not confirmed.');
     const actualSha = await resolveTag(inputs.repository, inputs.target.tag);
     result.target.commitSha = actualSha;
     result.target.state = !actualSha ? 'missing' : actualSha === inputs.target.commitSha ? 'resolved' : 'changed';
     if (result.target.state !== 'resolved') { finish(); return; }
 
-    const expected = expand(manifest, inputs.target.fullVersion);
-    if (expected.length === 0 || expected.length > 5000) throw new CheckError('CHECK_NOT_CONFIGURED', 'Manifest публикации пуст или слишком велик.');
+    if (expected.length === 0 || expected.length > 5000) throw new CheckError('CHECK_NOT_CONFIGURED', 'The publication manifest is empty or too large.');
     const requirements = expected.map(f => ({
       key: `${repositoryIdName}:${f.groupId}:${f.artifactId}:${inputs.target.fullVersion}:${f.extension}:${f.classifier ?? ''}`,
       required: true, kind: 'maven',
       coordinate: { groupId: f.groupId, artifactId: f.artifactId, version: inputs.target.fullVersion, extension: f.extension, classifier: f.classifier ?? null },
       repositoryId: repositoryIdName, locator: { url: f.url },
     }));
-    if (new Set(requirements.map(r => r.key)).size !== requirements.length) throw new CheckError('CHECK_NOT_CONFIGURED', 'Manifest публикации содержит повторяющиеся файлы.');
+    if (new Set(requirements.map(r => r.key)).size !== requirements.length) throw new CheckError('CHECK_NOT_CONFIGURED', 'The publication manifest lists a file twice.');
     const groupsDigest = createHash('sha256').update(JSON.stringify(manifest.groups)).digest('hex');
     result.publication.requirementsComplete = true;
     result.publication.inventory = { adapterVersion: `publication-manifest/v1 ${manifest.generated?.method ?? 'unknown'} ${groupsDigest.slice(0, 12)}`, ...publicationManifestDigest(requirements), sourceSha: inputs.checker.workflowSha, reason: null };
 
-    for (const file of simulate.keys()) if (!expected.some(f => f.fileName === file)) throw new CheckError('CHECK_NOT_CONFIGURED', `Файл для симуляции не входит в manifest: ${file}.`);
+    for (const file of simulate.keys()) if (!expected.some(f => f.fileName === file)) throw new CheckError('CHECK_NOT_CONFIGURED', `The simulated file is not in the manifest: ${file}.`);
     const { observations } = await observeManifest(manifest, inputs.target.fullVersion, concurrency, simulate);
     for (const [i, o] of observations.entries()) {
       const conclusive = o.state === 'present' || o.state === 'missing';
@@ -435,7 +465,7 @@ async function emit(opts) {
       });
     }
     const unknown = result.publication.artifacts.filter(a => a.state === 'unknown').length;
-    if (unknown > 0) diagnostic('PACKAGE_PROBE_ERROR', `Доступность ${unknown} из ${result.publication.artifacts.length} файлов не установлена (ошибки доступа к registry).`, true);
+    if (unknown > 0) diagnostic('PACKAGE_PROBE_ERROR', `The availability of ${unknown} of ${result.publication.artifacts.length} files is unknown (registry access errors).`, true);
 
     const finalSha = await resolveTag(inputs.repository, inputs.target.tag);
     result.target.commitSha = finalSha;
@@ -443,21 +473,19 @@ async function emit(opts) {
     if (result.check.outcome === 'completed') result.publicationReady = result.target.state === 'resolved' && result.publication.artifacts.every(a => a.state === 'present');
   } catch (error) {
     if (error instanceof CheckError) diagnostic(error.code, error.message, error.retryable);
-    else if (error?.status === 401 || error?.status === 403) diagnostic('SOURCE_ACCESS_DENIED', 'GitHub отклонил доступ к репозиторию-источнику.', true);
-    else diagnostic('CHECK_ERROR', 'Проверка не завершена из-за внутренней ошибки; registry мог быть опрошен частично.', true);
+    else if (error?.status === 401 || error?.status === 403) diagnostic('SOURCE_ACCESS_DENIED', 'GitHub denied access to the source repository.', true);
+    else diagnostic('CHECK_ERROR', 'The check did not finish because of an internal error; the registry may have been queried in part.', true);
   }
   finish();
 }
 
 // ---------- line: declared version of a line branch head (line.json, schema adrm/line-state/v1) ----------
-// ADRM dispatches the project's wrapper on the line branch with mode=inspect; the wrapper runs this command on
-// the branch checkout (--from DIR) and uploads line.json as artifact line-state-<request_id>-<run_attempt>.
-// Nothing is built: only the build files a maintainer already keeps are read, and the first file that declares
-// a version wins (pom.xml, gradle.properties, version.txt, build.gradle(.kts), version.sbt, build.sbt).
-// Inputs: REQUEST_ID, GENERATION, GITHUB_REPOSITORY, GITHUB_REPOSITORY_ID, GITHUB_REF_NAME (the branch),
-// GITHUB_SHA (its head), EXPECTED_HEAD_SHA, EXPECTED_CHECKER_SHA, GITHUB_WORKFLOW_REF, GITHUB_WORKFLOW_SHA,
-// GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT, CHECKER_SETUP_STATUS, RESULT_PATH. ADRM classifies the version itself
-// (set / not bumped / invalid), so PRODUCT_VERSION and LINE_VERSION are accepted but not interpreted here.
+// mode=inspect: runs on the branch checkout (--from DIR); the wrapper uploads line.json as
+// line-state-<request_id>-<run_attempt>. The first build file that declares a version wins (pom.xml, gradle.properties,
+// version.txt, build.gradle(.kts), version.sbt, build.sbt); nothing is built.
+// Inputs: REQUEST_ID, GENERATION, GITHUB_REPOSITORY, GITHUB_REPOSITORY_ID, GITHUB_REF_NAME, GITHUB_SHA, EXPECTED_HEAD_SHA,
+// EXPECTED_CHECKER_SHA, GITHUB_WORKFLOW_REF, GITHUB_WORKFLOW_SHA, GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT, CHECKER_SETUP_STATUS,
+// RESULT_PATH. ADRM classifies the version; PRODUCT_VERSION and LINE_VERSION are not used here.
 const cleanVersion = v => { const t = (v ?? '').trim(); return t.length > 0 && t.length <= 256 ? t : null; };
 
 /** `<version>` of the root `<project>` itself; the `<parent>` version only when the project has none. */
@@ -510,8 +538,7 @@ function sbtVersion(content) {
   }
   return null;
 }
-/** Order matters: a Maven project is never confused with a Gradle one, and a gradle.properties without
- * `version=` (Iceberg) falls through to version.txt. */
+/** Checked in this order; a gradle.properties without `version=` (Iceberg) falls through to version.txt. */
 const VERSION_READERS = [
   { path: 'pom.xml', tool: 'maven', extract: mavenProjectVersion },
   { path: 'gradle.properties', tool: 'gradle', extract: c => propertyLine(c, 'version') },
@@ -559,7 +586,7 @@ async function line(opts) {
     writeFileSync(resultPath, JSON.stringify(state, null, 1));
     console.error(`line.json written to ${resultPath}: ${JSON.stringify({ branch: state.branch.state, version: state.version.state, value: state.version.value, source: state.version.source.path, errors: state.version.errors.map(e => e.code) })}`);
   };
-  const gate = dispatchGate(d, env, { skipped: 'версия не читалась', setupSkipped: 'build-файлы не читались' });
+  const gate = dispatchGate(d, env, { skipped: 'the version was not read', setupSkipped: 'no build files were read' });
   if (gate) { fail(gate.code, gate.message, gate.retryable); finish(); return; }
   try {
     const declared = readDeclaredVersion(dir);
@@ -567,7 +594,7 @@ async function line(opts) {
       ? { state: 'declared', value: declared.value, source: { tool: declared.tool, path: declared.path, method: 'files' }, errors: [] }
       : { state: 'undeclared', value: null, source: { tool: null, path: null, method: 'files' }, errors: [] };
   } catch (error) {
-    fail('VERSION_READ_ERROR', `Build-файлы не прочитаны: ${error.message}`);
+    fail('VERSION_READ_ERROR', `The build files could not be read: ${error.message}`);
   }
   finish();
 }

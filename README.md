@@ -50,10 +50,10 @@ by ADRM; the report does not assert it.
 
 3. **Add the regeneration** `.github/workflows/publication-manifest.yml` from `examples/publication-manifest-maven.yml`,
    `-gradle.yml` or `-sbt.yml`: the same publish commands as in `publish.yml`, the `sandbox` action before them and the
-   `manifest` action after. Set `timeout-minutes` to match `publish.yml` and pin `peter-evans/create-pull-request` by
-   SHA. The job has only `packages: read`, so nothing can be uploaded even if the redirection is lost; the `manifest`
+   `manifest` action after. Set `timeout-minutes` to match `publish.yml`; keep the actions pinned by SHA. The `manifest`
    action fails on an empty sandbox; the Gradle and sbt redirections fail if a task with a remote destination remains.
-   The workflow opens a pull request when the file set changes and fails the pull request check if the manifest is stale.
+   On a pull request the `manifest` job fails the check when the manifest is stale; on a manual run it hands a changed
+   manifest over as an artifact to the `pull-request` job, which opens the pull request.
 
    Maven: the redirection is added to `MAVEN_OPTS` through `GITHUB_ENV`. It overrides a job-level `MAVEN_OPTS` but not a
    step-level one; if the publish step sets `MAVEN_OPTS` in its own `env`, add the three `-Dalt…DeploymentRepository`
@@ -95,7 +95,8 @@ it is regenerated.
 The reusable workflow runs in the project's context: its `GITHUB_TOKEN` with `packages: read`, its workflow SHA. The
 `emit` steps:
 
-1. Validation of the ADRM inputs and that the workflow SHA matches the expected one.
+1. Validation of the ADRM inputs and that the workflow SHA matches the expected one; validation of the manifest: GitHub
+   Packages of the repository owner as the registry and plain Maven names (otherwise `CHECK_NOT_CONFIGURED`).
 2. Confirmation of the repository via the GitHub API, resolution of the tag to a commit and comparison with the ADRM
    target (`resolved`, `changed`, `missing`).
 3. Expansion of the manifest into the list of files for the version, signing the contents with the same digest that ADRM
@@ -209,17 +210,31 @@ six times without changing what ships; a `build_args` line with `-Padrm.configur
 commands, one per line of `build_args`:
 
 ```sh
-<mvn> -B -ntp -fae -T 1C -Dscan=false <build_args line> org.apache.maven.plugins:maven-dependency-plugin:3.11.0:tree -DoutputType=json -DoutputFile=target/adrm-dependency-tree.json -DoutputEncoding=UTF-8
-<gradlew> --init-script gradle/adrm-dependencies.init.gradle --no-configuration-cache --continue <build_args line> adrmDependencies
+<mvn> -B -ntp -fae -T 1C -Dscan=false --global-settings <adrm settings> <build_args line> org.apache.maven.plugins:maven-dependency-plugin:3.11.0:tree -DoutputType=json -DoutputFile=target/adrm-dependency-tree.json -DoutputEncoding=UTF-8
+<gradlew> --init-script gradle/adrm-dependencies.init.gradle --no-daemon --no-configuration-cache --continue <build_args line> adrmDependencies
 ```
 
+Every invocation runs in its own `eclipse-temurin:<java_version>-jdk` container (`docker run --rm`, as the runner's
+user) with the checkout, the build's home (empty at the start of the job), the launcher (a bare `mvn` is the runner's
+installation, mounted read-only) and the adrm files mounted, and with `GITHUB_ACTOR`, `GITHUB_USERNAME` and
+`GITHUB_TOKEN` as the only job variables.
+
 The wrapper carries the project's static values: `build_tool` (`maven`, `gradle` or `sbt`), `build_command` (`mvn`,
-`./mvnw`, `./build/mvn`, `./gradlew`), `java_version` (Maven: the publisher's JDK, because JDK-activated profiles change
-the graph; Gradle: the highest JDK the publisher uses), `java_distribution`, `maven_server_ids` (the server ids the
-build resolves from; each gets the workflow token in `~/.m2/settings.xml`) and `build_args` (the flags and profiles of
-`publish.yml`, one invocation per line, no goals or tasks, no quoting). Several invocations (the Scala and Flink
-variants of Iceberg) merge into one inventory by module coordinates. The job restores no Maven cache: the runner's
-`~/.m2` is empty, so `mavenLocal()` (first in Iceberg's repositories) cannot shadow the registries.
+`./mvnw`, `./build/mvn`, `./gradlew`), `java_version` (the major version of the image; Maven: the publisher's JDK,
+because JDK-activated profiles change the graph; Gradle: the highest JDK the publisher uses), `java_distribution`
+(`temurin` only), `maven_server_ids` and `build_args` (the flags and profiles of `publish.yml`, one invocation per
+line, no goals or tasks, no quoting). Several invocations (the Scala and Flink variants of Iceberg) merge into one
+inventory by module coordinates. The home starts empty, so `mavenLocal()` (first in Iceberg's repositories) cannot
+shadow the registries.
+
+List in `maven_server_ids` the ids of the repositories the build reads from GitHub Packages: each gets the workflow
+token and a mirror of the same id to `https://maven.pkg.github.com/<owner>/*`, so every repository with that id in the
+graph resolves from there. Leave out ids of repositories on other hosts (for example
+`https://maven.arenadata.io/arenadata`). When one id names two hosts across the modules (Hive:
+`https://maven.arenadata.io/arenadata` in the root POM, GitHub Packages in `standalone-metastore` and `storage-api`),
+list it in `maven_mirrors` instead, one `<id> <https url>` per line: every module then reads that id from the given
+registry. The servers and mirrors reach Maven as `--global-settings`, so they also apply when `build_args` name the
+project's own `--settings`.
 
 ```mermaid
 sequenceDiagram
@@ -233,7 +248,7 @@ sequenceDiagram
     ADRM->>GH: POST …/release-readiness.yml/dispatches, ref = line branch, mode=dependencies
     GH->>WF: run from the branch head, run-name "dependencies / request_id"
     WF->>RW: uses …/publication-readiness.yml@sha, inputs plus the static build values
-    RW->>RW: full checkout of the head, JDK, Maven servers with the workflow token
+    RW->>RW: full checkout of the head, build image, Maven servers pinned to GitHub Packages
     RW->>S: run: the build tool once per build_args line, graph resolution only
     S->>S: harvest target/adrm-dependency-tree.json or build/adrm-dependencies.json of every module, normalize
     RW->>S: report: envelope with the expected head and wrapper SHA, inventory state
@@ -424,7 +439,9 @@ inspection will see, without the ADRM inputs; `line --from DIR --out line.json` 
 in the workflow (`GITHUB_REF_NAME`, `GITHUB_SHA`, `EXPECTED_HEAD_SHA` instead of `TARGET_*`) writes the full `line.json`.
 
 Dependency inventory by hand: `node src/dependency-inventory.mjs run --tool maven --command mvn --args-file args.txt --from <checkout> --out /tmp/adrm-dependencies`
-runs the build tool once per line of `args.txt` and writes `/tmp/adrm-dependencies/inventory.json`;
+runs the build tool once per line of `args.txt` and writes `/tmp/adrm-dependencies/inventory.json`; add
+`--container eclipse-temurin:21-jdk` to run every invocation in a container as the workflow does, and
+`--maven-settings <file>` to pass a settings file as `--global-settings`;
 `normalize --tool maven --from <checkout> --out inventory.json` normalizes the `target/adrm-dependency-tree.json` files
 left by a manual `mvn … dependency:tree` run (Gradle: `build/adrm-dependencies.json` left by `adrmDependencies`);
 `report --inventory inventory.json --out dependencies.json --execution-mode fixture` with the environment variables of
@@ -447,8 +464,10 @@ for this.
 
 ## Limitations
 
-- Registry: any Maven repository over HTTPS with the standard layout; authorization is by Bearer token only (GitHub
-  Packages), Basic (Nexus) needs a small addition. Cross-checking against the registry contents is deliberately not done.
+- Registry: GitHub Packages of the repository owner only, `https://maven.pkg.github.com/<owner>/<name>`. `generate`
+  refuses any other `--registry`; `emit` reports `CHECK_NOT_CONFIGURED` for any other address and for a group, module or
+  file name that is not a plain Maven name; `verify` reads other registries without a token. Cross-checking against the
+  registry contents is deliberately not done.
 - One version for all modules of a tag; SNAPSHOTs are not supported.
 - Tag, project version and branch formats are ADRM templates, overridable per repository in ADRM. The script never parses
   them: `emit` uses the tag, version and product version exactly as ADRM sends them, `line` reports the declared version

@@ -1,20 +1,18 @@
 #!/usr/bin/env node
-// Lost commits between line branches: the commits of older line branches (sources) that the current line branch
-// lacks, classified by layered evidence, and lost-commits.json (ADRM lost-commits v1) for mode=history runs.
+// Lost commits: the commits of older line branches (sources) that the current line branch lacks, classified layer by
+// layer; lost-commits.json (ADRM lost-commits v1) for mode=history.
 //
-//   upstream  the upstream repository of the project: the wrapper's static override, else the root of the fork
-//             network (GitHub API `source`), else none -> upstream.json.
-//   classify  candidates of a source = commits reachable from it, not from the current branch and not from any
-//             upstream tag present in the clone. Every candidate gets the verdict of the first layer of evidence that
-//             applies: empty commit, revert in the current branch, branch-local paths, patch-id, cherry-pick trailers,
-//             revert pairs, upstream ticket in the current upstream base, version bookkeeping, in-memory cherry-pick
-//             (merge-tree), series, hunks. Merges above the upstream base with their own changes need review.
-//             -> history.json. Needs a full clone and Git >= 2.40; refs and the worktree are never written, merge-tree
-//             only adds objects to the object store.
-//   report    wraps history.json into lost-commits.json with the ADRM envelope; inputs from env, as `line`.
+//   upstream  upstream.json: the wrapper's upstream_repository, else the root of the fork network (GitHub API
+//             `source`), else none.
+//   classify  history.json. The candidates of a source are the commits reachable from it, not from the current
+//             branch and not from any upstream tag in the clone. Each candidate gets the verdict of the first layer
+//             that applies: empty commit, revert on the current branch, branch-local paths, patch-id, cherry-pick
+//             trailers, revert pairs, upstream ticket in the upstream base, version bookkeeping, merge-tree, series,
+//             hunks. Merges above the upstream base with changes of their own go to review. Needs a full clone and
+//             Git 2.40+; writes no refs and no worktree (merge-tree only adds objects).
+//   report    lost-commits.json: history.json in the ADRM envelope; inputs from the environment, as for `line`.
 //
-// No dependencies; Node >= 20. Exit codes: 0 even when the state is error (ADRM reads it from the file), 2 for errors
-// of the script itself, 64 for usage.
+// Node >= 20, no dependencies. Exit codes: 0 also when the state is error, 2 for errors of the script, 64 for usage.
 
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -35,7 +33,7 @@ const VERDICTS = [
   'neutral:empty', 'neutral:revert-pair',
   'present:patch-id', 'present:cherry-pick-trailer', 'present:original-in-current', 'present:upstream-ticket-in-base', 'present:content', 'present:content-as-series', 'present:hunks',
 ];
-// Errors after which the report carries no findings: the candidates or their verdicts cannot be trusted.
+// Errors after which the report carries no findings.
 const FATAL = new Set(['INPUT_INVALID', 'HEAD_CHANGED', 'CHECKER_CHANGED', 'CHECKER_SETUP_ERROR', 'GIT_TOO_OLD', 'SHALLOW_HISTORY', 'UPSTREAM_UNAVAILABLE', 'CANDIDATE_LIMIT', 'CLASSIFY_ERROR', 'REPORT_TOO_LARGE']);
 // Ticket keys (ADH-8490, HADOOP-18867); the number must not continue (CVE-2021-44228), and common non-ticket tokens
 // (UTF-8, SHA-256, ISO-8601, TLS-1) never count.
@@ -115,8 +113,8 @@ function gitRunner(repo) {
   };
   const out = (args, opts) => run(args, opts).stdout;
   const ok = args => run(args, { allow: [0, 1, 128] }).status === 0;
-  /** git log|show ... | git patch-id --stable, streamed through a shell so large diffs never sit in memory: sha ->
-   * patch-id. `shas` go to stdin (log --stdin); an empty list returns an empty map unless `always` is set. */
+  /** sha -> patch-id from `git log|show ... | git patch-id --stable`, piped through sh to keep large diffs out of memory.
+   * `shas` go to stdin (log --stdin); an empty list returns an empty map unless `always` is set. */
   const patchIds = (args, shas, always = false) => {
     const map = new Map();
     if (!shas.length && !always) return map;
@@ -162,7 +160,7 @@ function classify(opts) {
   const fail = (code, message, retryable = false) => { pushError(history.errors, code, message, retryable); };
   const finish = () => {
     const unknown = history.findings.filter(f => !VERDICTS.includes(f.verdict));
-    if (unknown.length) fail('CLASSIFY_ERROR', `Классификатор выдал неизвестные вердикты: ${uniqueSorted(unknown.map(f => f.verdict)).join(', ')}.`);
+    if (unknown.length) fail('CLASSIFY_ERROR', `The classifier produced unknown verdicts: ${uniqueSorted(unknown.map(f => f.verdict)).join(', ')}.`);
     const fatal = history.errors.some(e => FATAL.has(e.code));
     if (fatal) history.findings = [];
     history.counts = countFindings(history.findings);
@@ -174,7 +172,7 @@ function classify(opts) {
   try {
     classifyInto(opts, history, fail);
   } catch (error) {
-    fail('CLASSIFY_ERROR', `Классификатор завершился с ошибкой: ${error.message}`, true);
+    fail('CLASSIFY_ERROR', `The classifier failed: ${error.message}`, true);
   }
   finish();
 }
@@ -190,19 +188,19 @@ function classifyInto(opts, history, fail) {
   let upstream = { repository: null, source: 'none', url: null, error: null };
   if (opts['upstream-file']) {
     try { const u = readJson(resolve(opts['upstream-file'])); upstream = { repository: u.repository ?? null, source: u.source ?? 'none', url: u.url ?? null, error: u.error ?? null }; }
-    catch (error) { upstream = { repository: null, source: 'none', url: null, error: { code: 'UPSTREAM_UNAVAILABLE', message: `upstream.json не прочитан: ${error.message}` } }; }
+    catch (error) { upstream = { repository: null, source: 'none', url: null, error: { code: 'UPSTREAM_UNAVAILABLE', message: `upstream.json could not be read: ${error.message}` } }; }
   } else if (opts['upstream-url']) {
     upstream = { repository: text(opts['upstream-repository']) || text(opts['upstream-url']).replace(/^https?:\/\/[^/]+\//, '').replace(/\.git$/, ''), source: text(opts['upstream-source']) || 'wrapper', url: text(opts['upstream-url']), error: null };
   }
   history.upstream = { repository: upstream.repository, source: upstream.source, releaseTags: 0 };
 
   const version = gitVersion();
-  if (!version || version.major < MIN_GIT[0] || (version.major === MIN_GIT[0] && version.minor < MIN_GIT[1])) { fail('GIT_TOO_OLD', `Нужен Git не ниже ${MIN_GIT.join('.')} (merge-tree --merge-base); на раннере ${version?.text ?? 'неизвестная версия'}.`); return; }
-  if (g.out(['rev-parse', '--is-shallow-repository']).trim() === 'true') { fail('SHALLOW_HISTORY', 'Клон репозитория неполный (shallow): для поиска потерянных коммитов нужна вся история, checkout с fetch-depth: 0.'); return; }
+  if (!version || version.major < MIN_GIT[0] || (version.major === MIN_GIT[0] && version.minor < MIN_GIT[1])) { fail('GIT_TOO_OLD', `Git ${MIN_GIT.join('.')} or newer is required (merge-tree --merge-base); the runner has ${version?.text ?? 'an unknown version'}.`); return; }
+  if (g.out(['rev-parse', '--is-shallow-repository']).trim() === 'true') { fail('SHALLOW_HISTORY', 'The clone is shallow: lost commits need the whole history (checkout with fetch-depth: 0).'); return; }
 
   // The current branch: `<branch>@<sha>` from the job, or a branch name for local use.
   const currentSpec = parseRefSpec(opts.current);
-  if (!currentSpec.valid) { fail('INPUT_INVALID', `Некорректная актуальная ветка: ${text(opts.current).slice(0, 300) || '(пусто)'}.`); return; }
+  if (!currentSpec.valid) { fail('INPUT_INVALID', `Invalid current branch: ${text(opts.current).slice(0, 300) || '(empty)'}.`); return; }
   const resolveBranch = branch => {
     for (const ref of [`refs/remotes/${remote}/${branch}`, `refs/heads/${branch}`]) {
       const r = g.run(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], { allow: [0, 1, 128] });
@@ -212,7 +210,7 @@ function classifyInto(opts, history, fail) {
   };
   const hasCommit = sha => g.ok(['cat-file', '-e', `${sha}^{commit}`]);
   const currentSha = currentSpec.sha ?? resolveBranch(currentSpec.branch);
-  if (!currentSha || !hasCommit(currentSha)) { fail('INPUT_INVALID', `Коммит актуальной ветки ${currentSpec.branch} не найден в клоне.`); return; }
+  if (!currentSha || !hasCommit(currentSha)) { fail('INPUT_INVALID', `The commit of the current branch ${currentSpec.branch} is not in the clone.`); return; }
   history.current = { ref: `refs/heads/${currentSpec.branch}`, sha: currentSha, upstreamBaseTags: [] };
 
   // Sources: a file of `<branch>@<sha>` lines (the compare_refs input) and/or a comma list for local use, where a
@@ -223,7 +221,7 @@ function classifyInto(opts, history, fail) {
     return spec.valid && !spec.sha ? `${spec.branch}@${resolveBranch(spec.branch) ?? NONE}` : s;
   });
   const parsed = parseRefLines([opts['sources-file'] ? readFileSync(resolve(opts['sources-file']), 'utf8') : '', ...listed].join('\n'));
-  if (parsed.invalid.length) { fail('INPUT_INVALID', `Некорректные строки compare_refs: ${parsed.invalid.slice(0, 5).join('; ')}.`); return; }
+  if (parsed.invalid.length) { fail('INPUT_INVALID', `Invalid compare_refs lines: ${parsed.invalid.slice(0, 5).join('; ')}.`); return; }
   const specs = [...new Map(parsed.specs.filter(s => s.branch !== currentSpec.branch).map(s => [s.branch, s])).values()].sort((a, b) => cmp(a.branch, b.branch));
   const sources = specs.map(spec => {
     const head = resolveBranch(spec.branch);
@@ -233,15 +231,15 @@ function classifyInto(opts, history, fail) {
   });
   history.sources = sources;
   const moved = sources.filter(s => s.state === 'changed' && s.evaluated), gone = sources.filter(s => !s.evaluated || s.state === 'missing');
-  if (gone.length) fail('SOURCE_MISSING', `Ветки-предшественницы не найдены${gone.some(s => !s.evaluated) ? ', их коммиты отсутствуют в клоне' : ''}: ${gone.map(s => s.ref.slice(11)).join(', ')}.`, true);
-  if (moved.length) fail('SOURCE_CHANGED', `Ветки-предшественницы сдвинулись после запроса; проверены запрошенные головы: ${moved.map(s => s.ref.slice(11)).join(', ')}.`, true);
+  if (gone.length) fail('SOURCE_MISSING', `Predecessor branches not found${gone.some(s => !s.evaluated) ? ', their commits are not in the clone' : ''}: ${gone.map(s => s.ref.slice(11)).join(', ')}.`, true);
+  if (moved.length) fail('SOURCE_CHANGED', `Predecessor branches moved after the request; the requested heads were checked: ${moved.map(s => s.ref.slice(11)).join(', ')}.`, true);
 
   // Upstream release tags present in the clone.
   let tags = { total: 0, shas: [], names: new Map() };
-  if (upstream.error) { fail(upstream.error.code === 'INPUT_INVALID' ? 'INPUT_INVALID' : 'UPSTREAM_UNAVAILABLE', upstream.error.message || 'Upstream-репозиторий недоступен.', upstream.error.code !== 'INPUT_INVALID'); return; }
+  if (upstream.error) { fail(upstream.error.code === 'INPUT_INVALID' ? 'INPUT_INVALID' : 'UPSTREAM_UNAVAILABLE', upstream.error.message || 'The upstream repository is unavailable.', upstream.error.code !== 'INPUT_INVALID'); return; }
   if (upstream.url) {
     try { tags = upstreamTags(g, upstream.url); }
-    catch (error) { fail('UPSTREAM_UNAVAILABLE', `Теги upstream-репозитория ${upstream.repository ?? upstream.url} не получены: ${error.message}`, true); return; }
+    catch (error) { fail('UPSTREAM_UNAVAILABLE', `The tags of the upstream repository ${upstream.repository ?? upstream.url} could not be fetched: ${error.message}`, true); return; }
   }
   history.upstream.releaseTags = tags.shas.length;
   const timings = {};
@@ -285,9 +283,9 @@ function classifyInto(opts, history, fail) {
   // (its commits are all in the current branch already).
   const unbased = sources.filter(s => s.evaluated && s.aboveUpstreamBase > 0 && !s.upstreamBaseTags.length);
   if (upstream.url && unbased.length) fail('UPSTREAM_BASE_UNTAGGED', tags.shas.length
-    ? `Ни один релизный тег upstream не является предком ветки ${unbased.map(s => s.ref.slice(11)).join(', ')}: upstream-база не определена, upstream-коммиты могут попасть в кандидаты.`
-    : `Ни одного тега upstream-репозитория ${upstream.repository ?? upstream.url} нет в истории клона (тегов в upstream: ${tags.total}): upstream-база не определена, upstream-коммиты могут попасть в кандидаты.`);
-  if (owners.size + mergeOwners.size > CANDIDATE_LIMIT) { fail('CANDIDATE_LIMIT', `Кандидатов ${owners.size + mergeOwners.size}, больше ${CANDIDATE_LIMIT}: вероятно, upstream-база не определена (проверьте upstream_repository) или ветки не относятся к одной линии.`); return; }
+    ? `No upstream release tag is an ancestor of ${unbased.map(s => s.ref.slice(11)).join(', ')}: the upstream base is unknown, upstream commits may count as candidates.`
+    : `No tag of the upstream repository ${upstream.repository ?? upstream.url} is in the history of the clone (${tags.total} upstream tags): the upstream base is unknown, upstream commits may count as candidates.`);
+  if (owners.size + mergeOwners.size > CANDIDATE_LIMIT) { fail('CANDIDATE_LIMIT', `${owners.size + mergeOwners.size} candidates, more than ${CANDIDATE_LIMIT}: the upstream base is probably unknown (check upstream_repository) or the branches belong to different lines.`); return; }
   const candidates = [...owners.keys()];
 
   // Commit data of the candidates, in batches.
@@ -442,7 +440,7 @@ function classifyInto(opts, history, fail) {
         else if (timed('version', () => versionOnly(sha, files))) { verdict = 'expected:version-bookkeeping'; layer = 'version'; }
         else {
           const parent = item.parents[0];
-          const sim = parent ? timed('merge-tree', () => simulate(parent, sha)) : { state: 'error', files: [], message: 'корневой коммит без родителя' };
+          const sim = parent ? timed('merge-tree', () => simulate(parent, sha)) : { state: 'error', files: [], message: 'a root commit without a parent' };
           let series = null;
           if (sim.state !== 'present' && parent) {
             const mine = new Set(files);
@@ -507,9 +505,9 @@ async function upstream(opts) {
   if (override) {
     if (/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(override)) result = { repository: override, source: 'wrapper', url: `https://github.com/${override}.git`, error: null };
     else if (/^https:\/\/[^\s@]+$/.test(override)) result = { repository: override.replace(/^https:\/\/[^/]+\//, '').replace(/\.git$/, ''), source: 'wrapper', url: override, error: null };
-    else result = { repository: null, source: 'wrapper', url: null, error: { code: 'INPUT_INVALID', message: `upstream_repository должен быть owner/name или https-адресом: ${override.slice(0, 200)}.` } };
+    else result = { repository: null, source: 'wrapper', url: null, error: { code: 'INPUT_INVALID', message: `upstream_repository must be owner/name or an https URL: ${override.slice(0, 200)}.` } };
   } else if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)) {
-    result = { repository: null, source: 'fork-network-root', url: null, error: { code: 'INPUT_INVALID', message: 'Не задан репозиторий проекта (--repository owner/name).' } };
+    result = { repository: null, source: 'fork-network-root', url: null, error: { code: 'INPUT_INVALID', message: 'The project repository is not set (--repository owner/name).' } };
   } else {
     try {
       const res = await fetch(`https://api.github.com/repos/${repository}`, { headers: { Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28', ...(process.env.GITHUB_TOKEN ? { Authorization: `Bearer ${process.env.GITHUB_TOKEN}` } : {}) }, signal: AbortSignal.timeout(30000) });
@@ -518,7 +516,7 @@ async function upstream(opts) {
       const root = meta && meta.fork && meta.source && typeof meta.source.full_name === 'string' ? meta.source : null;
       result = root ? { repository: root.full_name, source: 'fork-network-root', url: typeof root.clone_url === 'string' ? root.clone_url : `https://github.com/${root.full_name}.git`, error: null } : { repository: null, source: 'none', url: null, error: null };
     } catch (error) {
-      result = { repository: null, source: 'fork-network-root', url: null, error: { code: 'UPSTREAM_UNAVAILABLE', message: `Корень сети форков ${repository} не получен из GitHub API: ${error.message}.` } };
+      result = { repository: null, source: 'fork-network-root', url: null, error: { code: 'UPSTREAM_UNAVAILABLE', message: `The root of the fork network of ${repository} could not be fetched from the GitHub API: ${error.message}.` } };
     }
   }
   writeJson(outPath, result);
@@ -526,7 +524,7 @@ async function upstream(opts) {
 }
 
 // ---------- report: the ADRM envelope (lost-commits.json, lost-commits v1) ----------
-// Inputs come from the dispatching workflow, as for `line`: REQUEST_ID, GENERATION, GITHUB_REPOSITORY,
+// Inputs from the environment, as for `line`, plus COMPARE_REFS: REQUEST_ID, GENERATION, GITHUB_REPOSITORY,
 // GITHUB_REPOSITORY_ID, GITHUB_REF_NAME, GITHUB_SHA, EXPECTED_HEAD_SHA, GITHUB_WORKFLOW_REF, GITHUB_WORKFLOW_SHA,
 // EXPECTED_CHECKER_SHA, GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT, CHECKER_SETUP_STATUS, COMPARE_REFS, RESULT_PATH.
 function report(opts) {
@@ -545,20 +543,20 @@ function report(opts) {
     checkedAt: new Date().toISOString(),
     history: emptyHistory(),
   };
-  const gate = dispatchGate(d, env, { skipped: 'история веток не анализировалась', setupSkipped: 'классификатор не запускался' });
+  const gate = dispatchGate(d, env, { skipped: 'the branch history was not analysed', setupSkipped: 'the classifier did not run' });
   if (gate) result.history.errors.push(gate);
-  else if (requested.invalid.length) pushError(result.history.errors, 'INPUT_INVALID', `Некорректные строки compare_refs: ${requested.invalid.slice(0, 5).join('; ')}.`);
+  else if (requested.invalid.length) pushError(result.history.errors, 'INPUT_INVALID', `Invalid compare_refs lines: ${requested.invalid.slice(0, 5).join('; ')}.`);
   else {
     let history = null;
     try { history = readJson(historyPath); }
-    catch (error) { pushError(result.history.errors, 'CHECKER_SETUP_ERROR', `Классификатор не выполнен: ${historyPath} отсутствует или не читается (${error.message}).`, true); }
+    catch (error) { pushError(result.history.errors, 'CHECKER_SETUP_ERROR', `The classifier did not run: ${historyPath} is missing or unreadable (${error.message}).`, true); }
     if (history) {
       const wellFormed = typeof history === 'object' && STATES.includes(history.state) && ['sources', 'findings', 'errors'].every(k => Array.isArray(history[k])) && history.counts && typeof history.counts === 'object';
       const wanted = uniqueSorted([...new Map(requested.specs.filter(s => s.branch !== d.inputs.branch).map(s => [s.branch, `refs/heads/${s.branch}@${s.sha}`])).values()]);
       const got = wellFormed ? uniqueSorted(history.sources.map(s => `${s.ref}@${s.sha}`)) : [];
       const sameCurrent = wellFormed && (history.current === null ? history.state === 'error' : history.current.ref === result.commit.ref && history.current.sha === d.headSha);
-      if (!wellFormed) pushError(result.history.errors, 'CHECKER_SETUP_ERROR', `Файл ${historyPath} не является результатом классификатора.`, true);
-      else if (!sameCurrent || (history.state !== 'error' && JSON.stringify(got) !== JSON.stringify(wanted))) pushError(result.history.errors, 'CHECKER_SETUP_ERROR', 'Результат классификатора относится к другим веткам, чем запрос ADRM.', true);
+      if (!wellFormed) pushError(result.history.errors, 'CHECKER_SETUP_ERROR', `${historyPath} is not a classifier result.`, true);
+      else if (!sameCurrent || (history.state !== 'error' && JSON.stringify(got) !== JSON.stringify(wanted))) pushError(result.history.errors, 'CHECKER_SETUP_ERROR', 'The classifier result is for other branches than the ADRM request.', true);
       else result.history = history;
     }
   }
@@ -567,7 +565,7 @@ function report(opts) {
   if (Buffer.byteLength(body, 'utf8') > REPORT_LIMIT) {
     const counts = result.history.counts;
     result.history = { ...result.history, state: 'error', findings: [], counts: emptyCounts(), errors: [...result.history.errors] };
-    pushError(result.history.errors, 'REPORT_TOO_LARGE', `Отчёт превышает 16 МиБ; находки не переданы (находок ${counts.findings}, потеряно ${counts.lost}, на разбор ${counts.review}).`);
+    pushError(result.history.errors, 'REPORT_TOO_LARGE', `The report exceeds 16 MiB; the findings are left out (${counts.findings} findings, ${counts.lost} lost, ${counts.review} to review).`);
     body = JSON.stringify(result);
   }
   writeFileSync(resultPath, body);

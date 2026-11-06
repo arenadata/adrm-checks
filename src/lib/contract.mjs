@@ -1,11 +1,10 @@
-// Shared pieces of the ADRM report contracts (line.json for mode=inspect, dependencies.json for mode=dependencies):
-// argument parsing, identity regexes, the inputs every run dispatched on a branch receives from the wrapper, and the
-// gate that turns a stale or broken dispatch into a diagnostic instead of a report built on the wrong commit.
+// Shared by the report commands: argument parsing, identity patterns, the inputs of a run dispatched on a branch and
+// the checks that run before anything is read or built.
 
 export const SHA = /^[0-9a-f]{40}$/;
 export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-/** `<command> --key value --flag`: a value starting with `--` is taken as the next key, so file paths go through files. */
+/** `<command> --key value --flag`; a value that starts with `--` is read as the next key. */
 export function parseArgs(argv) {
   const [command, ...rest] = argv;
   const opts = {};
@@ -20,10 +19,10 @@ export function parseArgs(argv) {
 }
 
 /**
- * Inputs of a run dispatched by ADRM on a branch, read from the workflow environment: REQUEST_ID, GENERATION,
- * GITHUB_REPOSITORY, GITHUB_REPOSITORY_ID, GITHUB_REF_NAME, GITHUB_SHA, EXPECTED_HEAD_SHA, GITHUB_WORKFLOW_REF,
- * GITHUB_WORKFLOW_SHA, EXPECTED_CHECKER_SHA, GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT. Returns the raw inputs, the list of
- * invalid ones (in the order ADRM shows them), the branch state and the identity blocks every report carries.
+ * Inputs of a run dispatched on a branch, from the environment: REQUEST_ID, GENERATION, GITHUB_REPOSITORY,
+ * GITHUB_REPOSITORY_ID, GITHUB_REF_NAME, GITHUB_SHA, EXPECTED_HEAD_SHA, GITHUB_WORKFLOW_REF, GITHUB_WORKFLOW_SHA,
+ * EXPECTED_CHECKER_SHA, GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT. Returns the values, the invalid ones, the branch state and
+ * the identity blocks of the report.
  */
 export function readBranchDispatch(env) {
   const inputs = {
@@ -51,15 +50,13 @@ export function readBranchDispatch(env) {
 }
 
 /**
- * The gate every branch-mode report passes before reading or building anything. Returns null when the run may go on,
- * otherwise the diagnostic to report instead: invalid inputs, a branch head that moved since ADRM looked, a wrapper
- * revision other than the one ADRM expected, or a failed preparatory step. `texts.skipped` and `texts.setupSkipped`
- * say what was not done ("версия не читалась", "build-файлы не читались").
+ * null when the run may go on, otherwise the diagnostic: invalid inputs, a moved branch head, another wrapper revision
+ * or a failed setup step. `texts.skipped` and `texts.setupSkipped` name what was not done.
  */
 export function dispatchGate(d, env, texts) {
-  if (d.invalid.length) return { code: 'INPUT_INVALID', message: `Некорректные входные данные workflow: ${d.invalid.join(', ')}.`, retryable: false };
-  if (d.branchState === 'changed') return { code: 'HEAD_CHANGED', message: `Голова ветки ${d.inputs.branch} (${d.headSha.slice(0, 7)}) отличается от ожидаемой ADRM; ${texts.skipped}.`, retryable: true };
-  if (d.inputs.checker.workflowSha !== d.inputs.checker.expectedSha) return { code: 'CHECKER_CHANGED', message: `Версия проверяющего workflow отличается от ожидаемой ADRM; ${texts.skipped}.`, retryable: true };
-  if (env.CHECKER_SETUP_STATUS && env.CHECKER_SETUP_STATUS !== 'success') return { code: 'CHECKER_SETUP_ERROR', message: `Подготовительный шаг workflow завершился с ошибкой; ${texts.setupSkipped}.`, retryable: true };
+  if (d.invalid.length) return { code: 'INPUT_INVALID', message: `Invalid workflow inputs: ${d.invalid.join(', ')}.`, retryable: false };
+  if (d.branchState === 'changed') return { code: 'HEAD_CHANGED', message: `The head of ${d.inputs.branch} (${d.headSha.slice(0, 7)}) differs from the one ADRM expects; ${texts.skipped}.`, retryable: true };
+  if (d.inputs.checker.workflowSha !== d.inputs.checker.expectedSha) return { code: 'CHECKER_CHANGED', message: `The checker workflow revision differs from the one ADRM expects; ${texts.skipped}.`, retryable: true };
+  if (env.CHECKER_SETUP_STATUS && env.CHECKER_SETUP_STATUS !== 'success') return { code: 'CHECKER_SETUP_ERROR', message: `A setup step of the workflow failed; ${texts.setupSkipped}.`, retryable: true };
   return null;
 }

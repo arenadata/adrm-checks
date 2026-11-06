@@ -1,10 +1,12 @@
 name: ADRM dependency inventory
 description: >
-  Resolves the dependency graph of a checkout from the build itself, without compiling or publishing: Maven runs
-  maven-dependency-plugin 3.11.0 `tree` (JSON per module, POM collection only) and Gradle runs an init-script task
-  that walks the resolution result of every classpath configuration in every project. Each line of `args` is one
-  invocation (the publisher's flags and profiles, no goals or tasks). Writes <out>/inventory.json; the step never
-  fails because of the build: failures land in inventory.state and inventory.errors.
+  Resolves the dependency graph of a checkout from the build, without compiling or publishing: Maven runs
+  maven-dependency-plugin 3.11.0 `tree` (JSON per module, POMs only) and Gradle runs an init-script task over the
+  resolution result of every classpath configuration in every project. Each line of `args` is one invocation (the
+  publisher's flags and profiles, no goals or tasks). With `container`, every invocation runs in its own `docker run
+  --rm` with the checkout, the build's home and the launcher mounted and GITHUB_ACTOR, GITHUB_USERNAME and
+  GITHUB_TOKEN as the only job variables. Writes <out>/inventory.json; build failures go into inventory.state and
+  inventory.errors, not into the step result.
 inputs:
   tool:
     description: maven, gradle or sbt (sbt yields state unsupported)
@@ -25,6 +27,14 @@ inputs:
     description: Output directory (created)
     required: false
     default: ''
+  container:
+    description: Image for the build, one container per invocation (the JDK comes from the image, a bare launcher such as mvn from the host); empty runs the build on the host
+    required: false
+    default: ''
+  maven-settings:
+    description: Maven only. Settings file passed to every invocation as --global-settings
+    required: false
+    default: ''
 outputs:
   state:
     description: inventory.state (complete, partial, error or unsupported)
@@ -43,6 +53,8 @@ runs:
         ARGS: ${{ inputs.args }}
         FROM: ${{ inputs.from }}
         OUT_INPUT: ${{ inputs.out }}
+        CONTAINER: ${{ inputs.container }}
+        MAVEN_SETTINGS: ${{ inputs.maven-settings }}
         ACTION_PATH: ${{ github.action_path }}
       run: |
         set -euo pipefail
@@ -51,6 +63,12 @@ runs:
         printf '%s\n' "$ARGS" > "$out/args.txt"
         cmd=(run --tool "$TOOL" --args-file "$out/args.txt" --from "$FROM" --out "$out")
         if [ -n "$COMMAND" ]; then cmd+=(--command "$COMMAND"); fi
+        if [ -n "$CONTAINER" ]; then
+          [[ "$CONTAINER" =~ ^[A-Za-z0-9][A-Za-z0-9._/:@-]*$ ]] || { echo "::error::invalid container image: $CONTAINER"; exit 1; }
+          docker pull --quiet "$CONTAINER"
+          cmd+=(--container "$CONTAINER")
+        fi
+        if [ -n "$MAVEN_SETTINGS" ]; then cmd+=(--maven-settings "$MAVEN_SETTINGS"); fi
         node "$ACTION_PATH/../../src/dependency-inventory.mjs" "${cmd[@]}"
         echo "inventory=$out/inventory.json" >> "$GITHUB_OUTPUT"
         echo "state=$(node -p 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).state' "$out/inventory.json")" >> "$GITHUB_OUTPUT"

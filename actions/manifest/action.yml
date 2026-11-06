@@ -9,7 +9,7 @@ inputs:
     required: false
     default: ${{ github.repository }}
   registry:
-    description: Registry base URL recorded in the manifest
+    description: 'Registry base URL recorded in the manifest: GitHub Packages of the repository owner, https://maven.pkg.github.com/<owner>/<name> (default: the repository itself)'
     required: false
     default: ''
   out:

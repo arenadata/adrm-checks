@@ -131,7 +131,7 @@ test('normalize --raw merges invocations by module coordinates and reports a fai
   assert.deepEqual(inv.invocations, [{ command: 'mvn tree -Pone', exitCode: 0, durationMs: 10 }, { command: 'mvn tree -Ptwo', exitCode: 1, durationMs: 20 }]);
   assert.deepEqual(inv.counts, { modules: 1, components: 2, edges: 2, invocations: 2, failedInvocations: 1 });
   assert.deepEqual(inv.errors.map(e => [e.code, e.retryable]), [['INVOCATION_FAILED', true]]);
-  assert.match(inv.errors[0].message, /#2 код 1: mvn tree -Ptwo/);
+  assert.match(inv.errors[0].message, /#2 exit 1: mvn tree -Ptwo/);
 });
 
 test('normalize is deterministic: the order of the raw files does not change the result', () => {
@@ -222,6 +222,86 @@ test('run: a launcher exit code other than 0 makes the inventory partial with a 
   assert.equal(run(['run', '--tool', 'maven', '--command', './missing-launcher', '--from', dir, '--out', join(dir, 'out2')]).status, 2);
 });
 
+function recordingLauncher(dir) {
+  // Records its arguments and its environment, leaves no module files.
+  const launcher = join(dir, 'fake-tool');
+  writeFileSync(launcher, `#!/bin/sh\nprintf '%s\\n' "$@" > "$(dirname "$0")/args.out"\nenv > "$(dirname "$0")/env.out"\nexit 0\n`);
+  chmodSync(launcher, 0o755);
+}
+
+test('run on the host: the build gets none of the runner file-command and runtime variables; Gradle runs without a daemon', () => {
+  const dir = temp('run-env');
+  recordingLauncher(dir);
+  const runner = { GITHUB_ENV: join(dir, 'env'), GITHUB_PATH: join(dir, 'path'), GITHUB_OUTPUT: join(dir, 'output'), GITHUB_STATE: join(dir, 'state'), GITHUB_STEP_SUMMARY: join(dir, 'summary'), ACTIONS_RUNTIME_TOKEN: 'runtime', ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'oidc' };
+  const r = run(['run', '--tool', 'gradle', '--command', './fake-tool', '--from', dir, '--out', join(dir, 'out')], { ...runner, GITHUB_TOKEN: 'synthetic', GITHUB_ACTOR: 'someone' });
+  assert.equal(r.status, 0, r.stderr);
+  const env = readFileSync(join(dir, 'env.out'), 'utf8');
+  for (const name of Object.keys(runner)) assert.doesNotMatch(env, new RegExp(`^${name}=`, 'm'), name);
+  assert.match(env, /^GITHUB_TOKEN=synthetic$/m);
+  const args = readFileSync(join(dir, 'args.out'), 'utf8').trim().split('\n');
+  assert.deepEqual(args.slice(2, 5), ['--no-daemon', '--no-configuration-cache', '--continue']);
+  assert.equal(args.at(-1), 'adrmDependencies');
+});
+
+test('run: --maven-settings reaches every Maven invocation as --global-settings before the publisher flags', () => {
+  const dir = temp('run-settings');
+  fakeLauncher(dir);
+  write(join(dir, 'settings.xml'), '<settings/>');
+  write(join(dir, 'args.txt'), '-Pdist\n');
+  const r = run(['run', '--tool', 'maven', '--command', './fake-mvn', '--args-file', join(dir, 'args.txt'), '--maven-settings', join(dir, 'settings.xml'), '--from', dir, '--out', join(dir, 'out')]);
+  assert.equal(r.status, 0, r.stderr);
+  const args = readFileSync(join(dir, 'launcher-args.txt'), 'utf8').trim().split('\n');
+  const at = args.indexOf('--global-settings');
+  assert.equal(args[at + 1], join(dir, 'settings.xml'));
+  assert.ok(at > 0 && at < args.indexOf('-Pdist'));
+  assert.equal(run(['run', '--tool', 'maven', '--command', './fake-mvn', '--maven-settings', join(dir, 'missing.xml'), '--from', dir, '--out', join(dir, 'out2')]).status, 2);
+});
+
+test('run --container: one docker run per invocation, the credentials passed by name', () => {
+  const dir = temp('run-container');
+  fakeLauncher(dir);
+  // Stands in for the docker CLI: records its arguments and its environment instead of starting a container.
+  write(join(dir, 'bin/docker'), `#!/bin/sh\nprintf '%s\\n' "$@" > "${dir}/docker-args.out"\nenv > "${dir}/docker-env.out"\nexit 0\n`);
+  chmodSync(join(dir, 'bin/docker'), 0o755);
+  write(join(dir, 'settings.xml'), '<settings/>');
+  const out = join(dir, 'out'), home = join(out, 'home');
+  const env = { PATH: `${join(dir, 'bin')}:${process.env.PATH}`, GITHUB_TOKEN: 'synthetic-secret', GITHUB_ACTOR: 'someone', GITHUB_ENV: join(dir, 'env'), GITHUB_PATH: join(dir, 'path'), ACTIONS_RUNTIME_TOKEN: 'runtime' };
+  const runIn = (image, outDir) => spawnSync('node', [script, 'run', '--tool', 'maven', '--command', './fake-mvn', '--maven-settings', join(dir, 'settings.xml'), '--container', image, '--from', dir, '--out', outDir], { encoding: 'utf8', env });
+  const r = runIn('eclipse-temurin:21-jdk', out);
+  assert.equal(r.status, 0, r.stderr);
+  const args = readFileSync(join(dir, 'docker-args.out'), 'utf8').trim().split('\n');
+  const image = args.indexOf('eclipse-temurin:21-jdk');
+  const options = args.slice(0, image);
+  assert.deepEqual(options.slice(0, 11), ['run', '--rm', '--init', '--user', `${process.getuid()}:${process.getgid()}`, '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--workdir', dir]);
+  const values = flag => options.flatMap((a, i) => a === flag ? [options[i + 1]] : []);
+  assert.deepEqual(values('--env'), [`HOME=${home}`, `GRADLE_USER_HOME=${join(home, '.gradle')}`, `JAVA_TOOL_OPTIONS=-Duser.home=${home}`, 'GITHUB_ACTOR', 'GITHUB_TOKEN']);
+  assert.deepEqual(values('--volume'), [`${dir}:${dir}`, `${home}:${home}`, `${join(dir, 'settings.xml')}:${join(dir, 'settings.xml')}:ro`]);
+  assert.deepEqual(args.slice(image + 1, image + 3), [join(dir, 'fake-mvn'), '-B']);
+  assert.equal(args[args.indexOf('--global-settings') + 1], join(dir, 'settings.xml'));
+  assert.equal(args.some(a => a.includes('synthetic-secret')), false, 'no token value on the docker command line');
+  const dockerEnv = readFileSync(join(dir, 'docker-env.out'), 'utf8');
+  assert.match(dockerEnv, /^GITHUB_TOKEN=synthetic-secret$/m);
+  for (const name of ['GITHUB_ENV', 'GITHUB_PATH', 'ACTIONS_RUNTIME_TOKEN']) assert.doesNotMatch(dockerEnv, new RegExp(`^${name}=`, 'm'), name);
+  assert.equal(existsSync(home), true);
+  // An image reference that docker would read as an option is refused.
+  const refused = runIn('-v=/:/host', join(dir, 'out2'));
+  assert.equal(refused.status, 2);
+  assert.match(refused.stderr, /--container must be an image reference/);
+});
+
+test('run: a module file that is a symbolic link is reported, not read', () => {
+  const dir = temp('run-symlink');
+  write(join(dir, 'outside.json'), node('org.example', 'outside', '1.0.0'));
+  writeFileSync(join(dir, 'fake-mvn'), '#!/bin/sh\nmkdir -p target\nln -sf ../outside.json target/adrm-dependency-tree.json\nexit 0\n');
+  chmodSync(join(dir, 'fake-mvn'), 0o755);
+  const r = run(['run', '--tool', 'maven', '--command', './fake-mvn', '--from', dir, '--out', join(dir, 'out')]);
+  assert.equal(r.status, 0, r.stderr);
+  const inv = json(join(dir, 'out/inventory.json'));
+  assert.deepEqual(inv.modules, []);
+  assert.match(inv.errors.find(e => e.code === 'TREE_PARSE_ERROR').message, /target\/adrm-dependency-tree\.json: not a regular file/);
+  assert.equal(existsSync(join(dir, 'outside.json')), true);
+});
+
 // ---------- report ----------
 const head = 'a'.repeat(40);
 const env = {
@@ -266,7 +346,7 @@ test('report: a moved head, another wrapper revision, invalid inputs and a faile
   assert.deepEqual([moved.inventory.modules, moved.inventory.components, moved.inventory.edges, moved.inventory.invocations], [[], [], [], []]);
   assert.deepEqual(moved.inventory.counts, emptyCounts);
   assert.deepEqual(moved.inventory.errors.map(e => [e.code, e.retryable]), [['HEAD_CHANGED', true]]);
-  assert.match(moved.inventory.errors[0].message, /граф зависимостей не строился/);
+  assert.match(moved.inventory.errors[0].message, /the dependency graph was not built/);
   const checker = reportOf(file, { GITHUB_WORKFLOW_SHA: 'c'.repeat(40) });
   assert.equal(checker.commit.state, 'resolved');
   assert.deepEqual(checker.inventory.errors.map(e => e.code), ['CHECKER_CHANGED']);
@@ -303,6 +383,6 @@ test('report: a report over 16 MiB keeps the envelope and the counts in the mess
   assert.deepEqual(d.inventory.counts, { ...emptyCounts, invocations: 1 });
   assert.equal(d.inventory.invocations.length, 1);
   assert.deepEqual(d.inventory.errors.map(e => e.code), ['REPORT_TOO_LARGE']);
-  assert.match(d.inventory.errors[0].message, /рёбер 320000/);
+  assert.match(d.inventory.errors[0].message, /320000 edges/);
   assert.ok(readFileSync(join(dir, 'dependencies.json')).length < 1024 * 1024);
 });

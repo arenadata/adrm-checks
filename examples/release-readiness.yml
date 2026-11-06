@@ -46,8 +46,10 @@ jobs:
       compare_refs: ${{ inputs.compare_refs }}
       # mode=dependencies: static values of this project, copied from its publisher workflow (flags and profiles
       # only, no goals or tasks). Maven: the publisher's JDK (JDK-activated profiles change the graph). Gradle: the
-      # highest JDK the publisher uses (graph resolution does not depend on it). maven_server_ids: the server ids of
-      # the repositories the build resolves from; each gets the workflow token in ~/.m2/settings.xml.
+      # highest JDK the publisher uses. The build runs in eclipse-temurin:<java_version>-jdk (java_distribution:
+      # temurin only). maven_server_ids: the ids of the repositories the build reads from GitHub Packages; they get the
+      # workflow token and resolve from https://maven.pkg.github.com/<owner>/*. maven_mirrors (`<id> <https url>` per
+      # line) points other ids at one registry, for an id that names two hosts across the modules.
       build_tool: maven
       build_command: mvn
       java_version: '21'
@@ -57,8 +59,10 @@ jobs:
         -DskipTests -Dmaven.javadoc.skip=true
       # Examples of the block for other projects:
       #   Hive 2.3.10 line: build_command mvn, java_version '8', build_args "-DskipTests -Dmaven.javadoc.skip=true"
-      #   Hive 4.3 line: build_command mvn, java_version '21', build_args "-DskipTests -Dmaven.javadoc.skip=true"
-      #   Curator: build_command mvn, java_version '21', maven_server_ids "arenadata,github", build_args "-DskipTests"
+      #   Hive 4.3 line: build_command mvn, java_version '21', build_args "-DskipTests -Dmaven.javadoc.skip=true",
+      #     maven_server_ids "", maven_mirrors "arenadata https://maven.arenadata.io/arenadata" (arenadata names two hosts)
+      #   Curator, Hadoop, ZooKeeper, Ozone: maven_server_ids "" (their arenadata is maven.arenadata.io)
+      #   Curator: build_command mvn, java_version '21', build_args "-DskipTests"
       #   Ozone: build_command mvn, java_version '21', build_args
       #     "--settings dev-support/ci/maven-settings.xml -Pdist -Psrc -DskipTests -DskipDocs -DskipRecon -Dmaven.javadoc.skip=true -Djacoco.skip -Drocks_tools_native"
       #   trino-hadoop-apache: build_command mvn, java_version '21', build_args "" (no profiles)

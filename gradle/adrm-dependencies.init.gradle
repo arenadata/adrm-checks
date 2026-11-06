@@ -1,10 +1,8 @@
-// ADRM dependency inventory (Gradle). Public API only. Registers `adrmDependencies` on every project: for every
-// resolvable configuration whose name matches the adrm.configurations pattern (default: compileClasspath and
-// runtimeClasspath of the main source set; test, integration or jmh classpaths multiply the graph several times
-// without changing what ships, pass -Padrm.configurations=<regex> to include them) it walks
-// incoming.resolutionResult, which reads POM and module metadata and downloads no artifacts, and writes
-// build/adrm-dependencies.json. Failures are recorded per configuration and never thrown. Apply with --init-script
-// (not init.d); run with --no-configuration-cache.
+// ADRM dependency inventory (Gradle, public API only). Registers `adrmDependencies` on every project. The task walks
+// incoming.resolutionResult (POM and module metadata, no artifacts) of every resolvable configuration whose name
+// matches adrm.configurations (default: compileClasspath and runtimeClasspath; -Padrm.configurations=<regex> adds
+// test, integration or jmh classpaths) and writes build/adrm-dependencies.json. Failures are recorded per
+// configuration. Apply with --init-script (not init.d) and --no-configuration-cache.
 import groovy.json.JsonOutput
 import org.gradle.api.artifacts.component.ModuleComponentIdentifier
 import org.gradle.api.artifacts.component.ProjectComponentIdentifier

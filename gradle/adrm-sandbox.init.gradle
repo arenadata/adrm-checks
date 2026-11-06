@@ -1,6 +1,6 @@
-// ADRM sandbox publish (Gradle). Public API only. Every PublishToMavenRepository task in the executed graph
-// whose repository is remote (http/https) is pointed at a fresh local file repository without credentials.
-// One report file per Gradle invocation; the build fails if any remote publish task is left untouched.
+// ADRM sandbox publish (Gradle, public API only). Every PublishToMavenRepository task of the task graph whose
+// repository is http or https is pointed at a local file repository. One report file per Gradle invocation; the build
+// fails if such a task is left.
 import org.gradle.api.publish.maven.tasks.PublishToMavenRepository
 
 def sandboxRoot = System.getenv('ADRM_SANDBOX_DIR')

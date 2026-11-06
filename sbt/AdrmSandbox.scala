@@ -1,9 +1,8 @@
-// ADRM publisher sandbox for sbt (sbt 1.x). Installed as a global plugin (~/.sbt/1.0/plugins/AdrmSandbox.scala)
-// by adrm-checks actions/sandbox, so the project's own `sbt publish` command runs unchanged.
-// Every project's `publish` writes to the file repository $ADRM_SANDBOX_DIR (Maven layout) instead of the
-// repository named by publishTo; the task fails if a project would still publish anywhere else.
-// Covers the standard `publish` task only: publishSigned (sbt-pgp), sbt-sonatype and custom publish tasks
-// are not redirected and must be added before such a project is onboarded.
+// ADRM publisher sandbox for sbt 1.x, installed by actions/sandbox as a global plugin
+// (~/.sbt/1.0/plugins/AdrmSandbox.scala); the project's own `sbt publish` runs unchanged. Every project's `publish`
+// writes to the file repository $ADRM_SANDBOX_DIR (Maven layout) instead of publishTo and fails if it would publish
+// anywhere else. Only the standard `publish` task is redirected: publishSigned (sbt-pgp), sbt-sonatype and custom
+// publish tasks need to be added first.
 import sbt._
 import sbt.Keys._
 import sbt.librarymanagement.ivy.InlineIvyConfiguration

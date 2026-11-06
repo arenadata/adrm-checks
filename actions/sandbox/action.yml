@@ -2,7 +2,7 @@ name: ADRM publisher sandbox
 description: >
   Redirects the project's own publisher to a local directory so that its real publish commands can run
   without uploading anything. Maven: alt*DeploymentRepository via MAVEN_OPTS. Gradle: init script in
-  GRADLE_USER_HOME/init.d that points PublishToMavenRepository tasks at a file repository. sbt: global
+  ~/.gradle/init.d that points PublishToMavenRepository tasks at a file repository. sbt: global
   plugin in ~/.sbt/1.0/plugins that points every project's publish at a file repository.
 inputs:
   tool:
